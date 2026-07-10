@@ -129,9 +129,9 @@ class VideoEncodingTask:
         # 映像
         ## コーデック
         if QUALITY[quality].is_hevc is True:
-            options.append('-vcodec hevc_rkmpp')  # H.265/HEVC (通信節約モード)
+            options.append('-vcodec libx265')  # H.265/HEVC (通信節約モード)
         else:
-            options.append('-vcodec h264_rkmpp')  # H.264
+            options.append('-vcodec libx264')  # H.264
 
         ## ビットレートと品質
         options.append(f'-flags +cgop+global_header -vb {QUALITY[quality].video_bitrate} -maxrate {QUALITY[quality].video_bitrate_max}')
