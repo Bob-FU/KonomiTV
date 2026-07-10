@@ -14,6 +14,7 @@ from rich import print
 from app import logging, schemas
 from app.config import Config, LoadConfig
 from app.constants import JST, LIBRARY_PATH
+from app.metadata.EPGStationMetadataProvider import EPGStationMetadataProvider
 from app.metadata.TSInfoAnalyzer import TSInfoAnalyzer
 from app.utils import ClosestMultiple
 from app.utils.TSInformation import TSInformation
@@ -525,51 +526,59 @@ class MetadataAnalyzer:
         )
 
         recorded_program = None
-        if container_format == 'MPEG-TS':
-            # FFprobe の programs 配列から、実際にストリームが存在する service_id を特定する
-            ## 複数サービスを含む TS ファイル (CS放送やマルチ編成) では、PAT に複数のサービスが含まれている場合がある
-            ## FFprobe は実際のストリーム構成を解析するため、nb_streams > 0 かつ pcr_pid > 0 の program_id が
-            ## 実際に放送されているサービスの service_id である可能性が高い
-            preferred_service_id: int | None = None
-            for program in full_probe.programs:
-                # nb_streams > 0 かつ pcr_pid > 0 のプログラムを探す
-                ## pcr_pid > 0 は実際に放送中のサービスを示す (pcr_pid == 0 は未使用のサブチャンネル)
-                if (program.nb_streams is not None and program.nb_streams > 0 and
-                    program.pcr_pid is not None and program.pcr_pid > 0 and
-                    program.program_num is not None):
-                    preferred_service_id = program.program_num
-                    logging.debug(
-                        f'{self.recorded_file_path}: Detected preferred service_id {preferred_service_id} from FFprobe '
-                        f'(nb_streams: {program.nb_streams}, pcr_pid: {program.pcr_pid}).'
-                    )
-                    break
+        # EPGStation の MariaDB から録画番組メタデータを取得する (機能が有効な場合のみ)
+        ## プロバイダがメタデータを取得できた場合は TSInfoAnalyzer による SDT/EIT 解析をスキップする
+        if Config().epgstation_metadata.enabled is True:
+            recorded_program = EPGStationMetadataProvider(recorded_video).analyze()
+            if recorded_program is not None:
+                logging.debug(f'{self.recorded_file_path}: EPGStation metadata analysis completed.')
+        # プロバイダがメタデータを取得できなかった場合のみ、TSInfoAnalyzer で SDT/EIT 解析を行う
+        if recorded_program is None:
+            if container_format == 'MPEG-TS':
+                # FFprobe の programs 配列から、実際にストリームが存在する service_id を特定する
+                ## 複数サービスを含む TS ファイル (CS放送やマルチ編成) では、PAT に複数のサービスが含まれている場合がある
+                ## FFprobe は実際のストリーム構成を解析するため、nb_streams > 0 かつ pcr_pid > 0 の program_id が
+                ## 実際に放送されているサービスの service_id である可能性が高い
+                preferred_service_id: int | None = None
+                for program in full_probe.programs:
+                    # nb_streams > 0 かつ pcr_pid > 0 のプログラムを探す
+                    ## pcr_pid > 0 は実際に放送中のサービスを示す (pcr_pid == 0 は未使用のサブチャンネル)
+                    if (program.nb_streams is not None and program.nb_streams > 0 and
+                        program.pcr_pid is not None and program.pcr_pid > 0 and
+                        program.program_num is not None):
+                        preferred_service_id = program.program_num
+                        logging.debug(
+                            f'{self.recorded_file_path}: Detected preferred service_id {preferred_service_id} from FFprobe '
+                            f'(nb_streams: {program.nb_streams}, pcr_pid: {program.pcr_pid}).'
+                        )
+                        break
 
-            # TS ファイルに含まれる番組情報・チャンネル情報を解析する
-            analyzer = TSInfoAnalyzer(recorded_video, end_ts_offset=end_ts_offset, preferred_service_id=preferred_service_id)
-            recorded_program = analyzer.analyze()  # 取得失敗時は None が返る
-            if recorded_program is not None:
-                logging.debug(f'{self.recorded_file_path}: MPEG-TS SDT/EIT analysis completed.')
-                # 取得成功時は録画開始時刻と録画終了時刻も解析する
-                recording_time = analyzer.analyzeRecordingTime()
-                if recording_time is not None:
-                    recorded_video.recording_start_time = recording_time[0]
-                    recorded_video.recording_end_time = recording_time[1]
+                # TS ファイルに含まれる番組情報・チャンネル情報を解析する
+                analyzer = TSInfoAnalyzer(recorded_video, end_ts_offset=end_ts_offset, preferred_service_id=preferred_service_id)
+                recorded_program = analyzer.analyze()  # 取得失敗時は None が返る
+                if recorded_program is not None:
+                    logging.debug(f'{self.recorded_file_path}: MPEG-TS SDT/EIT analysis completed.')
+                    # 取得成功時は録画開始時刻と録画終了時刻も解析する
+                    recording_time = analyzer.analyzeRecordingTime()
+                    if recording_time is not None:
+                        recorded_video.recording_start_time = recording_time[0]
+                        recorded_video.recording_end_time = recording_time[1]
+                else:
+                    # 取得失敗時、最終更新日時が現在時刻から30秒以内ならまだ録画中の可能性が高いので、None を返し DB には保存しない
+                    if (now - recorded_video.file_modified_at).total_seconds() < 30:
+                        logging.warning(f'{self.recorded_file_path}: MPEG-TS SDT/EIT analysis failed. (still recording?)')
+                        return None
             else:
-                # 取得失敗時、最終更新日時が現在時刻から30秒以内ならまだ録画中の可能性が高いので、None を返し DB には保存しない
-                if (now - recorded_video.file_modified_at).total_seconds() < 30:
-                    logging.warning(f'{self.recorded_file_path}: MPEG-TS SDT/EIT analysis failed. (still recording?)')
-                    return None
-        else:
-            # 何らかのメタ情報から番組情報・チャンネル情報を解析する
-            analyzer = TSInfoAnalyzer(recorded_video)
-            recorded_program = analyzer.analyze()  # 取得失敗時は None が返る
-            if recorded_program is not None:
-                logging.debug(f'{self.recorded_file_path}: {container_format} Service/Event analysis completed.')
-                # 取得成功時は録画開始時刻と録画終了時刻も解析する
-                recording_time = analyzer.analyzeRecordingTime()
-                if recording_time is not None:
-                    recorded_video.recording_start_time = recording_time[0]
-                    recorded_video.recording_end_time = recording_time[1]
+                # 何らかのメタ情報から番組情報・チャンネル情報を解析する
+                analyzer = TSInfoAnalyzer(recorded_video)
+                recorded_program = analyzer.analyze()  # 取得失敗時は None が返る
+                if recorded_program is not None:
+                    logging.debug(f'{self.recorded_file_path}: {container_format} Service/Event analysis completed.')
+                    # 取得成功時は録画開始時刻と録画終了時刻も解析する
+                    recording_time = analyzer.analyzeRecordingTime()
+                    if recording_time is not None:
+                        recorded_video.recording_start_time = recording_time[0]
+                        recorded_video.recording_end_time = recording_time[1]
 
         # MPEG-TS 形式ではなくメタ情報も存在しなければ番組情報は取得できないので、ファイル名などから最低限の情報を設定する
         # MPEG-TS 形式だが TS ファイルからチャンネル情報・番組情報を取得できなかった場合も同様

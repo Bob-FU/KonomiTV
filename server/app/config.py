@@ -354,12 +354,33 @@ class _ServerSettingsVideo(BaseModel):
 class _ServerSettingsCapture(BaseModel):
     upload_folders: list[DirectoryPath] = []
 
+class _ServerSettingsEPGStationMetadataDB(BaseModel):
+    # EPGStation の MariaDB 接続情報
+    ## enabled=false のときは接続されないため、各値は空文字でも起動できるようデフォルト値を設定している
+    host: str = '127.0.0.1'
+    port: int = 3306
+    user: str = ''
+    password: str = ''
+    database: str = ''
+
+class _ServerSettingsEPGStationMetadata(BaseModel):
+    # EPGStation の MariaDB から録画番組メタデータを取得する機能の設定
+    ## 有効にすると、録画ファイルのメタデータ解析時に EPGStation 側のデータベースから番組情報を優先取得する
+    ## 無効の場合は従来通り TSInfoAnalyzer による SDT/EIT 解析が行われる (デフォルト: 無効)
+    enabled: bool = False
+    # EPGStation の MariaDB 接続情報
+    db: _ServerSettingsEPGStationMetadataDB = _ServerSettingsEPGStationMetadataDB()
+    # KonomiTV 側の録画フォルダのローカルパス → EPGStation の parentDirectoryName の対応表
+    ## どの EPGStation 録画フォルダに属するファイルかを特定するために利用する
+    dir_map: dict[str, str] = {}
+
 class ServerSettings(BaseModel):
     general: _ServerSettingsGeneral = _ServerSettingsGeneral()
     server: _ServerSettingsServer = _ServerSettingsServer()
     tv: _ServerSettingsTV = _ServerSettingsTV()
     video: _ServerSettingsVideo = _ServerSettingsVideo()
     capture: _ServerSettingsCapture = _ServerSettingsCapture()
+    epgstation_metadata: _ServerSettingsEPGStationMetadata = _ServerSettingsEPGStationMetadata()
 
 
 # サーバー設定データと読み込み・保存用の関数

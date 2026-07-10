@@ -114,3 +114,34 @@ capture:
     upload_folders: [
         'E:\TV-Capture',
     ]
+
+# ==================== EPGStation メタデータ取得の設定 (任意) ====================
+# EPGStation の MariaDB に保存された録画番組メタデータを、KonomiTV の録画視聴メタデータの取得元として優先利用します。
+# 有効にすると、録画ファイルのメタデータ解析時に EPGStation 側のデータベースから番組情報を優先取得し、
+# 取得できなかった場合は従来通り TSInfoAnalyzer による SDT/EIT 解析にフォールバックします。
+# EPGStation をお使いでない場合は、enabled を false のままにしておいてください (デフォルトは無効です)。
+epgstation_metadata:
+
+    # EPGStation メタデータ取得機能を有効にするか
+    # デフォルトは false です。無効の場合は EPGStation に接続せず、従来通りの挙動になります。
+    enabled: false
+
+    # EPGStation の MariaDB 接続情報
+    # enabled=false のときは接続されないため、各値はそのままで起動できます。
+    db:
+        # MariaDB のホスト名
+        host: '127.0.0.1'
+        # MariaDB のポート番号 (デフォルト: 3306)
+        port: 3306
+        # MariaDB のユーザー名
+        user: 'epgstation'
+        # MariaDB のパスワード
+        password: 'epgstation'
+        # EPGStation のデータベース名
+        database: 'epgstation'
+
+    # KonomiTV 側の録画フォルダのローカルパス → EPGStation 側の parentDirectoryName の対応表
+    # どの EPGStation 録画フォルダに属するファイルかを特定するために利用します。
+    # 例: KonomiTV の録画フォルダが E:\TV-Record で、EPGStation 側の parentDirectoryName が 'TV-Record' の場合
+    #     dir_map: {'E:\TV-Record': 'TV-Record'}
+    dir_map: {}
