@@ -124,7 +124,7 @@ class VideoEncodingTask:
         ## 録画再生では逆に大きめでないと映像/音声のずれが大きくなりセグメント分割時に問題が生じるため、
         ## 5000K (5秒) に設定し、リトライ回数に応じて 1000K (1秒) ずつ増やす
         max_interleave_delta = round(5000 + (self._retry_count * 1000))
-        options.append(f'-fflags nobuffer -flags low_delay -max_delay 0 -tune zerolatency -max_interleave_delta {max_interleave_delta}K -threads auto')
+        options.append(f'-fflags nobuffer -flags low_delay -max_delay 0 -max_interleave_delta {max_interleave_delta}K -threads auto')
 
         # 映像
         ## コーデック
@@ -135,7 +135,7 @@ class VideoEncodingTask:
 
         ## ビットレートと品質
         options.append(f'-flags +cgop+global_header -vb {QUALITY[quality].video_bitrate} -maxrate {QUALITY[quality].video_bitrate_max}')
-        options.append('-preset veryfast -aspect 16:9 -pix_fmt:v yuv420p')
+        options.append('-aspect 16:9 -pix_fmt:v yuv420p')
         if QUALITY[quality].is_hevc is True:
             options.append('-profile:v main')
         else:
@@ -270,7 +270,7 @@ class VideoEncodingTask:
         ## H.265/HEVC の高圧縮化調整
         if QUALITY[quality].is_hevc is True:
             if encoder_type == 'QSVEncC':
-                options.append('--qvbr-quality 20 --extbrc --mbbrc --scenario-info game_streaming --tune perceptual')
+                options.append('--qvbr-quality 20 --extbrc --mbbrc --scenario-info game_streaming')
                 options.append('--i-adapt --b-adapt --b-pyramid --weightp --weightb --adapt-ref --adapt-ltr --adapt-cqm')
             elif encoder_type == 'NVEncC':
                 # --weightp は過去の GPU 世代で不安定な場合があるので使用しない
