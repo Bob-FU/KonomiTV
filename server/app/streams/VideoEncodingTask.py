@@ -369,7 +369,14 @@ class VideoEncodingTask:
         # 出力 TS のタイムスタンプオフセット
         options.append(f'-m output_ts_offset:{output_ts_offset}')
         # dts 合わせにするため、B フレームによる pts-dts ずれ量を補正する
-        options.append('--offset-video-dts-advance')
+        ## ただし rkmppenc では、この指定 + B フレーム (videoDelay > 0) のとき rkmppenc 内部で
+        ## output_ts_offset が videoDelay 分だけ書き換えられてしまい (rgy_output_avcodec.cpp)、
+        ## KonomiTV が source_start_dts を基準に組み立てる録画 HLS のセグメント境界と時刻がずれて
+        ## segment 0 が生成できず (該当セグメント API が空レスポンスになる) 再生できなくなる。
+        ## FFmpeg (このオプション自体が存在しない) では正常に再生できることから、録画再生に本オプションは不要なため、
+        ## rkmppenc のみ本オプションを付与しない。
+        if encoder_type != 'rkmppenc':
+            options.append('--offset-video-dts-advance')
 
         # 出力
         options.append('--output-format mpegts')  # MPEG-TS 出力ということを明示
