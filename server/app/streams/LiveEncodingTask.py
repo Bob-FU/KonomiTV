@@ -164,7 +164,7 @@ class LiveEncodingTask:
 
         ## ビットレートと品質
         options.append(f'-flags +cgop -vb {QUALITY[quality].video_bitrate} -maxrate {QUALITY[quality].video_bitrate_max}')
-        options.append('-aspect 16:9')
+        options.append('-preset veryfast -aspect 16:9')
         if QUALITY[quality].is_hevc is True:
             options.append('-profile:v main')
         else:
@@ -352,7 +352,7 @@ class LiveEncodingTask:
         ## H.265/HEVC の高圧縮化調整
         if QUALITY[quality].is_hevc is True:
             if encoder_type == 'QSVEncC':
-                options.append('--qvbr-quality 20 --extbrc --mbbrc --scenario-info game_streaming')
+                options.append('--qvbr-quality 20 --extbrc --mbbrc --scenario-info game_streaming --tune perceptual')
                 options.append('--i-adapt --b-adapt --b-pyramid --weightp --weightb --adapt-ref --adapt-ltr --adapt-cqm')
             elif encoder_type == 'NVEncC':
                 # --weightp は過去の GPU 世代で不安定な場合があるので使用しない
