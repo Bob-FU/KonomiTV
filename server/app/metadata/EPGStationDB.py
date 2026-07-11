@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,13 @@ import pymysql.cursors
 
 from app import logging
 from app.config import Config
+
+# スレッドローカルな DB コネクションを保持するストレージ
+## PyMySQL の Connection はスレッドセーフでないため、プロセス内でスレッドをまたいで共有すると
+## wire protocol / socket が破壊され 'read of closed file' 等のエラーを引き起こす
+## かつてはクラス変数 (_connection) でプロセス共有していたが、サムネイルプロキシ (asyncio.to_thread) による
+## マルチスレッド利用で競合するため、スレッドごとに独立したコネクションを保持するように変更した
+_thread_local = threading.local()
 
 
 @dataclass
@@ -56,10 +64,6 @@ class EPGStationDBClient:
     このクラスは SELECT のみを発行し、いかなる書き込みも行わない
     """
 
-    # プロセス単位でコネクションを遅延生成して再利用する (録画ファイルスキャン時にファイルごとに呼び出されるため)
-    ## コネクションが切れた場合は再接続を1回だけ試みる
-    _connection: pymysql.connections.Connection | None = None
-
     # 取得するカラム (recorded / video_file 両方)
     ## video_file 側のカラムは AS で別名をつけ、EPGStationRecordedRecord のフィールド名と整合させる
     _SELECT_COLUMNS: str = (
@@ -84,8 +88,10 @@ class EPGStationDBClient:
     @classmethod
     def _getConnection(cls, db_config: Any) -> pymysql.connections.Connection | None:
         """
-        プロセス単位でキャッシュされた DB コネクションを取得する
-        コネクションが未生成の場合は新規に生成する (読み取り専用・DictCursor・utf8mb4)
+        現在のスレッドに紐付いた DB コネクションを取得する
+        同一スレッド内ではコネクションを遅延生成して再利用し、コネクションが切れた場合は再接続を1回だけ試みる
+        スレッドごとに独立したコネクションを持つことで、マルチスレッド (asyncio.to_thread 等) からの
+        並行利用でも PyMySQL Connection の非スレッドセーフ性に起因する破損を防ぐ
 
         Args:
             db_config (Any): EPGStation の MariaDB 接続設定 (_ServerSettingsEPGStationMetadataDB)
@@ -94,19 +100,22 @@ class EPGStationDBClient:
             pymysql.connections.Connection | None: DB コネクション (接続失敗時は None)
         """
 
+        # 現在のスレッドに紐付いたコネクションを取得する (未所持の場合は None)
+        connection = getattr(_thread_local, 'connection', None)
+
         # 既存のコネクションがまだ有効であればそれを再利用する
-        if cls._connection is not None:
+        if connection is not None:
             try:
-                cls._connection.ping(reconnect=True)
-                return cls._connection
+                connection.ping(reconnect=True)
+                return connection
             except Exception as ex:
                 # コネクションが切れている場合は破棄して再接続を試みる
                 logging.debug('EPGStation DB connection ping failed. Reconnecting...', exc_info=ex)
                 try:
-                    cls._connection.close()
+                    connection.close()
                 except Exception:
                     pass
-                cls._connection = None
+                _thread_local.connection = None
 
         # 新規に読み取り専用コネクションを生成する
         try:
@@ -120,12 +129,12 @@ class EPGStationDBClient:
                 connect_timeout = 5,
                 cursorclass = pymysql.cursors.DictCursor,
             )
-            cls._connection = connection
+            _thread_local.connection = connection
             return connection
         except Exception as ex:
             # DB が不可達な場合は録画視聴スキャンを止めないよう、warning だけ出して None を返す
             logging.warning(f'EPGStation DB connection failed: {type(ex).__name__}: {ex}')
-            cls._connection = None
+            _thread_local.connection = None
             return None
 
     def _executeQuery(self, query: str, params: tuple[Any, ...]) -> list[dict[str, Any]] | None:
@@ -162,7 +171,7 @@ class EPGStationDBClient:
                     connection.close()
                 except Exception:
                     pass
-                self.__class__._connection = None
+                _thread_local.connection = None
                 connection = self._getConnection(self.db_config)
                 if connection is None:
                     return None
