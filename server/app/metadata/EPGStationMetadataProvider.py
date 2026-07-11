@@ -73,7 +73,7 @@ class EPGStationMetadataProvider:
 
             # 命中した生レコードを schemas.RecordedProgram にマッピングする
             ## マッピング処理は scan パスと B2 同期パスで共通利用できるよう staticmethod に切り出されている
-            recorded_program = self.mapRecordToProgram(record, self.recorded_video)
+            recorded_program = asyncio.run(self.mapRecordToProgram(record, self.recorded_video))
         except Exception as ex:
             # 取レコード/マッピング中に例外が発生した場合は録画スキャン全体を落とさないよう warning を出して None を返す
             ## (TSInfoAnalyzer にフォールバック)
@@ -87,7 +87,7 @@ class EPGStationMetadataProvider:
         return recorded_program
 
     @staticmethod
-    def mapRecordToProgram(
+    async def mapRecordToProgram(
         record: EPGStationRecordedRecord,
         recorded_video: schemas.RecordedVideo,
         analyze_recording_time: bool = True,
@@ -141,7 +141,7 @@ class EPGStationMetadataProvider:
             event_id = record.programId % 100000
 
         # チャンネル情報を合成する (network_id / service_id が取得でき、かつ network_type が判別できる場合のみ)
-        channel = EPGStationMetadataProvider._buildChannel(recorded_video.file_path, network_id, service_id) \
+        channel = await EPGStationMetadataProvider._buildChannel(recorded_video.file_path, network_id, service_id) \
             if (network_id is not None and service_id is not None) else None
 
         # ジャンル情報を構築する
@@ -194,7 +194,7 @@ class EPGStationMetadataProvider:
         return recorded_program
 
     @staticmethod
-    def _buildChannel(file_path: str, network_id: int, service_id: int) -> schemas.Channel | None:
+    async def _buildChannel(file_path: str, network_id: int, service_id: int) -> schemas.Channel | None:
         """
         network_id / service_id から schemas.Channel を合成する
         TSInfoAnalyzer.__analyzeSDTInformation() の 447-470 段と同じ枠組み・同じ TSInformation helper を使うが、
@@ -226,14 +226,13 @@ class EPGStationMetadataProvider:
             remocon_id = TSInformation.calculateRemoconID(channel_type, service_id)
 
         # チャンネル番号を算出
-        ## 本プロバイダも MetadataAnalyzer と同じく同期サブプロセスコンテキストで実行されるため、
-        ## 実行中のイベントループが存在せず asyncio.run() は安全に使える (TSInfoAnalyzer.__analyzeSDTInformation と同様)
-        channel_number = asyncio.run(TSInformation.calculateChannelNumber(
+        ## calculateChannelNumber は Channel テーブルを参照する非同期関数のため await する。呼び出し側は、B2 同期パス（主イベントループ）では await、scan パス（同期サブプロセス）では asyncio.run で駆動する
+        channel_number = await TSInformation.calculateChannelNumber(
             channel_type,
             network_id,
             service_id,
             remocon_id,
-        ))
+        )
 
         # チャンネル ID を生成
         channel_id = f'NID{network_id}-SID{service_id:03d}'
