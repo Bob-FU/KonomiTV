@@ -26,6 +26,7 @@ router = APIRouter(
     prefix = '/api/streams/video',
 )
 
+# video_id ごとのロックは意図的にクリアしない（total 数は録画件数で上限が付き、要素は極小の Lock のみでメモリは無視できる。release 直後の locked()==False による解放レースを避けるため）
 _file_locks: dict[int, asyncio.Lock] = {}
 _file_locks_dict_lock: asyncio.Lock = asyncio.Lock()
 
@@ -125,10 +126,6 @@ async def ValidateVideoID(video_id: Annotated[int, Path(description='録画番�
                 status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail = 'Failed to analyze AV metadata due to an unexpected error',
             )
-        finally:
-            async with _file_locks_dict_lock:
-                if video_id in _file_locks and not _file_locks[video_id].locked():
-                    _file_locks.pop(video_id, None)
 
     return recorded_program
 
