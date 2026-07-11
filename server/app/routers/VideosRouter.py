@@ -2,11 +2,13 @@
 import asyncio
 import json
 import pathlib
+from collections import OrderedDict
 from datetime import datetime
 from email.utils import parsedate
 from typing import Annotated, Any, Literal
 
 import anyio
+import httpx
 from ariblib.sections import TimeOffsetSection
 from fastapi import (
     APIRouter,
@@ -23,7 +25,9 @@ from starlette.datastructures import Headers
 from tortoise import connections
 
 from app import logging, schemas
+from app.config import Config
 from app.constants import STATIC_DIR, THUMBNAILS_DIR
+from app.metadata.EPGStationDB import EPGStationDBClient
 from app.metadata.RecordedScanTask import RecordedScanTask
 from app.metadata.ThumbnailGenerator import ThumbnailGenerator
 from app.metadata.TSInfoAnalyzer import TSInfoAnalyzer
@@ -42,6 +46,21 @@ router = APIRouter(
 
 # ページングで一度に取得する録画番組の数
 PAGE_SIZE = 30
+
+# EPGStation サムネイルプロキシ用の共有 HTTP クライアント (モジュール単位で再利用し、TCP ハンドシェイクの重複を避ける)
+## リクエストごとに新規クライアントを生成しないことで、録画一覧読み込み時などの大量サムネイル取得の性能を向上させる
+_epgstation_http_client: httpx.AsyncClient | None = None
+
+# EPGStation サムネイル ID のメモリキャッシュ (recorded_video.id -> thumbnail_id or None)
+## 録画ファイルは不変で id->thumbnail_id が安定しているため、DB 問い合わせを抑制する
+## None (EPGStation 側に縮図無し) もキャッシュし、非 EPGStation ファイルへの反復クエリを防ぐ
+## 容量上限付き LRU (標準ライブラリのみで実装し、新規依存は導入しない)
+_epgstation_thumbnail_id_cache: OrderedDict[int, int | None] = OrderedDict()
+_EPGSTATION_THUMBNAIL_ID_CACHE_LIMIT = 512
+
+# EPGStation からのプロキシ時に許容する Content-Type の白リスト (大文字小文字区別なし、; 以降のパラメータは無視)
+## 上流が text/html 等を返した場合に XSS リスクを防ぐため、画像以外はデフォルトサムネイルにフォールバックする
+_EPGSTATION_ALLOWED_CONTENT_TYPES = frozenset({'image/jpeg', 'image/png', 'image/webp', 'image/gif'})
 
 
 async def ConvertRowToRecordedProgram(row: dict[str, Any]) -> schemas.RecordedProgram:
@@ -263,6 +282,63 @@ async def GetThumbnailResponse(
     # 録画中のファイルは常にデフォルトのサムネイル画像を返す
     if recorded_program.recorded_video.status == 'Recording':
         return CreateDefaultThumbnailResponse()
+
+    # EPGStation 連携が有効な場合は、サムネイル画像を EPGStation の HTTP API からプロキシ取得する
+    ## 自前でのサムネイルタイル生成・CM 区間検出は行われないため、ローカルファイルには依存しない
+    if Config().epgstation_metadata.enabled:
+        # tile 版は EPGStation に等価物がないため常にデフォルト画像
+        if return_tiled:
+            return CreateDefaultThumbnailResponse()
+        url_base = Config().epgstation_metadata.url
+        if not url_base:
+            return CreateDefaultThumbnailResponse()
+        rv = recorded_program.recorded_video
+        # TODO: もし EPGStation 側で Basic 認証等が有効な場合は、ここに認証ヘッダーを付与する必要がある
+        try:
+            # thumbnail_id をメモリキャッシュから取得 (未ヒット時は DB へ問い合わせ)
+            thumbnail_id = _epgstation_thumbnail_id_cache.get(rv.id)
+            if thumbnail_id is None and rv.id not in _epgstation_thumbnail_id_cache:
+                # EPGStationDBClient の生成も含めてスレッドプールで実行し、イベントループを占有しない
+                def _resolveThumbnailId() -> int | None:
+                    return EPGStationDBClient().findThumbnailId(rv.file_path, rv.file_size)
+                thumbnail_id = await asyncio.to_thread(_resolveThumbnailId)
+                # キャッシュに書き戻す (容量上限に達したら最も古いエントリを破棄)
+                _epgstation_thumbnail_id_cache[rv.id] = thumbnail_id
+                if len(_epgstation_thumbnail_id_cache) > _EPGSTATION_THUMBNAIL_ID_CACHE_LIMIT:
+                    _epgstation_thumbnail_id_cache.popitem(last=False)
+            elif rv.id in _epgstation_thumbnail_id_cache:
+                # ヒット時は LRU 順序を更新し、最近使用されたエントリが末尾に残るようにする
+                _epgstation_thumbnail_id_cache.move_to_end(rv.id)
+            if thumbnail_id is None:
+                return CreateDefaultThumbnailResponse()
+            request_url = url_base.rstrip('/') + f'/api/thumbnails/{thumbnail_id}'
+            # 共有クライアントを遅延生成して再利用する (初回および競合時は新規に生成)
+            global _epgstation_http_client
+            if _epgstation_http_client is None or _epgstation_http_client.is_closed:
+                _epgstation_http_client = httpx.AsyncClient(timeout=10.0)
+            upstream = await _epgstation_http_client.get(request_url)
+            if upstream.status_code != 200:
+                return CreateDefaultThumbnailResponse()
+            # 上流の Content-Type を画像白リストで検査し、画像以外はデフォルトにフォールバックする (XSS 対策)
+            raw_content_type = upstream.headers.get('content-type', '')
+            content_type = raw_content_type.split(';', 1)[0].strip().lower()
+            if content_type not in _EPGSTATION_ALLOWED_CONTENT_TYPES:
+                logging.warning(
+                    f'EPGStation thumbnail upstream returned non-image Content-Type {raw_content_type!r} '
+                    f'for video_id {recorded_program.id}. Falling back to default thumbnail.'
+                )
+                return CreateDefaultThumbnailResponse()
+            return Response(
+                content = upstream.content,
+                media_type = content_type,
+                headers = {
+                    'Cache-Control': 'public, no-transform, max-age=86400',
+                    'X-Content-Type-Options': 'nosniff',
+                },
+            )
+        except Exception as ex:
+            logging.warning(f'Failed to proxy EPGStation thumbnail for video_id {recorded_program.id}: {ex}')
+            return CreateDefaultThumbnailResponse()
 
     # サムネイル画像のパスを生成
     suffix = '_tile' if return_tiled else ''
@@ -912,6 +988,12 @@ async def VideoThumbnailRegenerateAPI(
     指定された録画番組のサムネイル画像を再生成する。<br>
     サムネイル画像の再生成には数分程度かかる場合がある。
     """
+
+    # EPGStation 連携が有効な場合は、ローカルのサムネイルを自主生成していないため no-op とする
+    ## 204 No Content を返して成功パスと同じ挙動を保つ
+    if Config().epgstation_metadata.enabled:
+        logging.info(f'[VideoThumbnailRegenerateAPI] EPGStation integration is enabled. Skipping local thumbnail regeneration for video_id {recorded_program.id}.')
+        return Response(status_code = status.HTTP_204_NO_CONTENT)
 
     try:
         # RecordedProgram モデルを schemas.RecordedProgram に変換

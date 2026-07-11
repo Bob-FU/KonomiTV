@@ -206,6 +206,42 @@ class EPGStationDBClient:
             size = row.get('size'),
         )
 
+    def findThumbnailId(self, file_path: str, file_size: int) -> int | None:
+        """
+        録画ファイルに紐づく EPGStation thumbnail レコードの id を取得する
+        サムネイル画像のプロキシ取得 (HTTP GET /api/thumbnails/{id}) に利用する
+
+        Args:
+            file_path (str): 録画ファイルのローカル絶対パス
+            file_size (int): 録画ファイルのバイト数
+
+        Returns:
+            int | None: thumbnail.id (存在しない場合や DB 不可達時は None)
+        """
+
+        # 【仮定】thumbnail テーブル構造/APIパスは実 DB で要検証
+
+        try:
+            # まず findRecord で recorded レコードを特定する
+            record = self.findRecord(file_path, file_size)
+            if record is None or record.id is None:
+                return None
+
+            # 当該録画に紐づく縮図画像の id を1件取得する (複数ある場合は最小 id を代表として使う)
+            query = 'SELECT MIN(id) AS thumbnail_id FROM thumbnail WHERE recordedId = %s'
+            rows = self._executeQuery(query, (record.id,))
+            if rows is None or len(rows) == 0:
+                return None
+            thumbnail_id = rows[0].get('thumbnail_id')
+            if thumbnail_id is None:
+                return None
+            return int(thumbnail_id)
+
+        except Exception as ex:
+            # このメソッドは UI/サムネイル表示の補助的な用途であり、失敗しても録画視聴を止めないよう安全に None を返す
+            logging.debug(f'EPGStation DB findThumbnailId failed for {file_path}: {type(ex).__name__}: {ex}')
+            return None
+
     def findRecord(self, file_path: str, file_size: int) -> EPGStationRecordedRecord | None:
         """
         録画ファイルのローカル絶対パスとファイルサイズから、対応する EPGStation 側のレコードを取得する

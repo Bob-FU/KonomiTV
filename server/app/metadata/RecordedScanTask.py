@@ -714,7 +714,10 @@ class RecordedScanTask:
                 ## "Recording" 状態の録画ファイルはまだ録画が完了していないので、サムネイル生成などの解析タスクは実行しない
                 ## DB 保存に失敗した状態で開始すると、RecordedVideo が存在しないままサムネイル生成だけが進んでしまうため、この処理は永続化後に実行する必要がある
                 if recorded_program.recorded_video.status == 'Recorded':
-                    if file_path not in self._background_tasks:
+                    # EPGStation 連携が有効な場合は、サムネイル生成・CM 区間検出・人物顔検出といった
+                    ## CPU 負荷の高いバックグラウンド解析を自主実行せず、サムネイルは EPGStation の HTTP API にプロキシする
+                    ## (cm_sections は None のままでプレイヤー側に委ねる)
+                    if self.config.epgstation_metadata.enabled is False and file_path not in self._background_tasks:
                         task = asyncio.create_task(self.__runBackgroundAnalysis(recorded_program))
                         self._background_tasks[file_path] = task
 
@@ -1163,6 +1166,12 @@ class RecordedScanTask:
         """
 
         logging.info('Starting thumbnail metadata migration...')
+
+        # EPGStation 連携が有効な場合は、サムネイル情報の移行・再生成も自主実行しない
+        ## EPGStation 側が既にサムネイルを保有しているため、本処理による CPU 負荷を抑止する
+        if self.config.epgstation_metadata.enabled is True:
+            logging.info('EPGStation metadata integration is enabled. Skipping thumbnail metadata migration.')
+            return
 
         # サムネイルフォルダが存在しない場合はマイグレーション不要
         thumbnails_dir = anyio.Path(str(THUMBNAILS_DIR))

@@ -373,6 +373,9 @@ class _ServerSettingsEPGStationMetadata(BaseModel):
     # KonomiTV 側の録画フォルダのローカルパス → EPGStation の parentDirectoryName の対応表
     ## どの EPGStation 録画フォルダに属するファイルかを特定するために利用する
     dir_map: dict[str, str] = {}
+    # (本项目新增) EPGStation の HTTP API ベース URL (サムネイル画像のプロキシ取得に使用)
+    ## 例: 'http://192.168.1.10:8888' 。末尾スラッシュはあってもなくてもよい (利用時に正規化する)
+    url: str = ''
 
 class ServerSettings(BaseModel):
     general: _ServerSettingsGeneral = _ServerSettingsGeneral()
