@@ -535,6 +535,15 @@ class MetadataAnalyzer:
         if av_result is None:
             return None
         recorded_video, _, _ = av_result
+        # 録画開始/終了時刻を TS の TOT から解析して設定する (jikkyo 過去ログの正確な整列に必要)
+        ## ファイルは既に AV 解析で読んでいるため追加コストは小さい。失敗時は None のままとし、呼び出し側が同期時の近似値を保持する
+        try:
+            recording_time = TSInfoAnalyzer(recorded_video).analyzeRecordingTime()
+            if recording_time is not None:
+                recorded_video.recording_start_time = recording_time[0]
+                recorded_video.recording_end_time = recording_time[1]
+        except Exception as ex:
+            logging.debug(f'{self.recorded_file_path}: Failed to analyze recording time from TS for lazy AV load.', exc_info=ex)
         return recorded_video
 
     def analyze(self) -> schemas.RecordedProgram | None:

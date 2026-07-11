@@ -326,8 +326,10 @@ class RecordedScanTask:
                         file_size = file_size,
                         file_created_at = file_created_at,
                         file_modified_at = file_modified_at,
-                        recording_start_time = None,
-                        recording_end_time = None,
+                        # jikkyo 過去ログの時間窓・整列のため、EPGStation の startAt/endAt を録画開始/終了時刻の近似値として設定する
+                        ## 純 DB 同期のため物理境界(TS の TOT)は読まない。正確な値は初回再生時の遅延解析で上書きされる
+                        recording_start_time = file_created_at,
+                        recording_end_time = file_modified_at,
                         duration = duration,
                         container_format = 'MPEG-TS',
                         video_codec = 'MPEG-2',

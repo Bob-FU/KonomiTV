@@ -104,6 +104,12 @@ async def ValidateVideoID(video_id: Annotated[int, Path(description='録画番�
                     current_video.secondary_audio_channel = analyzed_video.secondary_audio_channel
                     current_video.secondary_audio_sampling_rate = analyzed_video.secondary_audio_sampling_rate
 
+                    # 録画開始/終了時刻は TOT 解析成功時のみ上書きし、失敗時は同期時の近似値(startAt/endAt)を残す
+                    if analyzed_video.recording_start_time is not None:
+                        current_video.recording_start_time = analyzed_video.recording_start_time
+                    if analyzed_video.recording_end_time is not None:
+                        current_video.recording_end_time = analyzed_video.recording_end_time
+
                     await current_video.save()
 
                 # 本リクエストで解析を実行したかに関わらず、最新の recorded_program を再取得して返す (古いデータによる競合を修正)
