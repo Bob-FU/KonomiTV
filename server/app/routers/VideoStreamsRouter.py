@@ -1,6 +1,8 @@
 
 import asyncio
 import json
+import pathlib
+from concurrent.futures import ProcessPoolExecutor
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
@@ -8,19 +10,24 @@ from fastapi.responses import Response
 from sse_starlette.sse import EventSourceResponse
 
 from app import logging
+from app.metadata.MetadataAnalyzer import MetadataAnalyzer
 from app.models.RecordedProgram import RecordedProgram
+from app.models.RecordedVideo import RecordedVideo
 from app.streams.StreamEncodingOptions import (
     SplitQualityAndEncodingOptions,
     StreamQualityWithOptions,
 )
 from app.streams.VideoStream import VideoStream
-
+from app.utils import ShutdownProcessPoolExecutor
 
 # ルーター
 router = APIRouter(
     tags = ['Streams'],
     prefix = '/api/streams/video',
 )
+
+_file_locks: dict[int, asyncio.Lock] = {}
+_file_locks_dict_lock: asyncio.Lock = asyncio.Lock()
 
 
 async def ValidateVideoID(video_id: Annotated[int, Path(description='録画番組の ID 。')]) -> RecordedProgram:
@@ -36,6 +43,92 @@ async def ValidateVideoID(video_id: Annotated[int, Path(description='録画番�
             status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail = 'Specified video_id was not found',
         )
+
+    if recorded_program.recorded_video.file_hash == '':
+        async with _file_locks_dict_lock:
+            lock = _file_locks.setdefault(video_id, asyncio.Lock())
+
+        try:
+            async with lock:
+                # 二次確認
+                current_video = await RecordedVideo.get_or_none(id=recorded_program.recorded_video.id)
+                if current_video is not None and current_video.file_hash == '':
+                    logging.info(f'[VideoStreamsRouter][ValidateVideoID] Lazy loading AV metadata for video_id: {video_id}')
+
+                    analyzer = MetadataAnalyzer(pathlib.Path(current_video.file_path))
+                    loop = asyncio.get_running_loop()
+                    executor = ProcessPoolExecutor(max_workers=1)
+                    should_wait_executor = True
+
+                    try:
+                        analyzed_video = await loop.run_in_executor(executor, analyzer.analyzeAVMetadataOnly)
+                    except asyncio.CancelledError:
+                        should_wait_executor = False
+                        await ShutdownProcessPoolExecutor(executor, is_cancelled=True)
+                        raise
+                    except Exception as ex:
+                        logging.error('[VideoStreamsRouter][ValidateVideoID] MetadataAnalyzer threw an exception:', exc_info=ex)
+                        analyzed_video = None
+                    finally:
+                        if should_wait_executor is True:
+                            await ShutdownProcessPoolExecutor(executor, is_cancelled=False)
+
+                    if analyzed_video is None:
+                        current_video.status = 'AnalysisFailed'
+                        await current_video.save()
+
+                        logging.error(f'[VideoStreamsRouter][ValidateVideoID] Failed to analyze AV metadata. [video_id: {video_id}]')
+                        raise HTTPException(
+                            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail = 'Failed to analyze AV metadata',
+                        )
+
+                    current_video.file_hash = analyzed_video.file_hash
+                    current_video.file_size = analyzed_video.file_size
+                    current_video.file_created_at = analyzed_video.file_created_at
+                    current_video.file_modified_at = analyzed_video.file_modified_at
+                    current_video.duration = analyzed_video.duration
+                    current_video.container_format = analyzed_video.container_format
+                    current_video.video_codec = analyzed_video.video_codec
+                    current_video.video_codec_profile = analyzed_video.video_codec_profile
+                    current_video.video_scan_type = analyzed_video.video_scan_type
+                    current_video.video_frame_rate = analyzed_video.video_frame_rate
+                    current_video.video_resolution_width = analyzed_video.video_resolution_width
+                    current_video.video_resolution_height = analyzed_video.video_resolution_height
+                    current_video.has_video_stream_changes = analyzed_video.has_video_stream_changes
+                    current_video.primary_audio_codec = analyzed_video.primary_audio_codec
+                    current_video.primary_audio_channel = analyzed_video.primary_audio_channel
+                    current_video.primary_audio_sampling_rate = analyzed_video.primary_audio_sampling_rate
+                    current_video.secondary_audio_codec = analyzed_video.secondary_audio_codec
+                    current_video.secondary_audio_channel = analyzed_video.secondary_audio_channel
+                    current_video.secondary_audio_sampling_rate = analyzed_video.secondary_audio_sampling_rate
+
+                    await current_video.save()
+
+                # 本リクエストで解析を実行したかに関わらず、最新の recorded_program を再取得して返す (古いデータによる競合を修正)
+                recorded_program = await RecordedProgram.filter(id=video_id).get_or_none() \
+                    .select_related('recorded_video') \
+                    .select_related('channel')
+                if recorded_program is None:
+                    raise HTTPException(
+                        status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail = 'Recorded program not found after AV analysis',
+                    )
+
+        except HTTPException:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            logging.error('[VideoStreamsRouter][ValidateVideoID] Unexpected error during lazy loading AV metadata:', exc_info=ex)
+            raise HTTPException(
+                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail = 'Failed to analyze AV metadata due to an unexpected error',
+            )
+        finally:
+            async with _file_locks_dict_lock:
+                if video_id in _file_locks and not _file_locks[video_id].locked():
+                    _file_locks.pop(video_id, None)
 
     return recorded_program
 

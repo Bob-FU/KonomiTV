@@ -18,6 +18,8 @@ from app import logging, schemas
 from app.config import Config
 from app.constants import JST, THUMBNAILS_DIR
 from app.metadata.CMSectionsDetector import CMSectionsDetector
+from app.metadata.EPGStationDB import EPGStationDBClient, EPGStationRecordedRecord
+from app.metadata.EPGStationMetadataProvider import EPGStationMetadataProvider
 from app.metadata.MetadataAnalyzer import MetadataAnalyzer
 from app.metadata.ThumbnailGenerator import ThumbnailGenerator
 from app.models.Channel import Channel
@@ -197,22 +199,233 @@ class RecordedScanTask:
         録画フォルダ以下の一括スキャンと DB への同期と録画フォルダ以下のファイルシステム変更の監視を開始し、
         変更があれば随時メタデータを解析後、DB に永続化する
         このメソッドは start() 経由でサーバー起動時に app.py から自動的に呼ばれ、サーバーの起動中は常時稼働し続ける
+
+        EPGStation メタデータ統合が有効な場合は、録画フォルダのスキャン・監視を行わず、代わりに EPGStation DB からの
+        同期 (runEPGStationSync) をポーリング間隔 (sync_interval) ごとに定期的に実行する
         """
 
         try:
-            # runBatchScan() が完了しなくても新しく録画されたファイルの監視を開始するため、同時に実行する
-            await asyncio.gather(
-                # サーバー起動時の一括スキャン・同期を実行
-                self.runBatchScan(),
-                # 録画フォルダの監視を開始
-                self.watchRecordedFolders(),
-            )
+            # EPGStation メタデータ統合が有効な場合は、純 DB 同期モードに切り替える
+            ## 録画フォルダのスキャン・監視 (runBatchScan / watchRecordedFolders) は一切行わない
+            if self.config.epgstation_metadata.enabled is True:
+                # 起動直後に1回だけ同期を実行し、以降は sync_interval 秒ごとに定期同期を繰り返す
+                await self.runEPGStationSync()
+                while self._is_running:
+                    try:
+                        await asyncio.sleep(self.config.epgstation_metadata.sync_interval)
+                    except asyncio.CancelledError:
+                        raise
+                    if not self._is_running:
+                        break
+                    await self.runEPGStationSync()
+            else:
+                # EPGStation 統合が無効な場合は従来通り録画フォルダの一括スキャンと監視を同時実行する
+                # runBatchScan() が完了しなくても新しく録画されたファイルの監視を開始するため、同時に実行する
+                await asyncio.gather(
+                    # サーバー起動時の一括スキャン・同期を実行
+                    self.runBatchScan(),
+                    # 録画フォルダの監視を開始
+                    self.watchRecordedFolders(),
+                )
         except asyncio.CancelledError:
             raise
         except Exception as ex:
             logging.error('Error in RecordedScanTask:', exc_info=ex)
         finally:
             self._is_running = False
+
+
+    def _resolveLocalFilePathFromRecord(self, record: EPGStationRecordedRecord) -> str | None:
+        """
+        EPGStation の recorded レコード (parentDirectoryName + filePath) と dir_map から、
+        KonomiTV 側のローカル絶対パスを逆解決する
+
+        dir_map は {ローカルパスプレフィックス: EPGStation parentDirectoryName} の対応表であるため、
+        record.parentDirectoryName に一致するプレフィックスを逆引きし、ローカルパス / filePath (POSIX 相対) を結合する
+
+        Args:
+            record (EPGStationRecordedRecord): EPGStation の recorded / video_file テーブルから取得した生レコード
+
+        Returns:
+            str | None: 逆解決したローカル絶対パス (dir_map に対応するエントリがない場合は None)
+        """
+
+        # parentDirectoryName / filePath が欠損しているレコードはパス逆解決不能のためスキップ
+        if record.parentDirectoryName is None or record.filePath is None:
+            return None
+
+        # dir_map の {ローカルプレフィックス: parentDirectoryName} を走査し、record の parentDirectoryName に一致する最初のエントリで逆解決する
+        for local_prefix_str, parent_dir_name in self.config.epgstation_metadata.dir_map.items():
+            if parent_dir_name == record.parentDirectoryName:
+                # EPGStation の filePath は POSIX 相対パス (区切り文字 '/') であるため、そのまま Path として結合する
+                return str(anyio.Path(local_prefix_str) / anyio.Path(record.filePath))
+
+        # 対応する dir_map エントリがないレコードは KonomiTV 側で管理していないファイルのためスキップ
+        return None
+
+
+    async def runEPGStationSync(self) -> None:
+        """
+        EPGStation DB から録画ライブラリを KonomiTV の DB へ同期するタスク (B2)
+        純 DB→DB 同期であり、ffprobe / hash / ファイル読み込みを一切伴わない
+        AV 情報 (codec/解像度など) は占位値で仮登録し、初回再生時の遅延 ffprobe (B3) で上書きされる前提とする
+
+        - EPGStation DB の enumerateRecords() で録画済み全レコードを取得
+        - 各レコードを占位 RecordedVideo + RecordedProgram にマッピングして DB に upsert
+          (既に B3 で ffprobe 済みの AV 情報を持つレコードは、その AV 情報を保持したまま EPG メタデータだけ更新する)
+        - 同期漏れレコードの削除の照合 (enumerateRecords() が空リストを返した場合は誤削除回避のため削除をスキップ)
+        """
+
+        try:
+            # EPGStation DB から録画済み全レコードを列挙する (DB 不可達時は [] が返る)
+            db_client = EPGStationDBClient()
+            records = db_client.enumerateRecords()
+
+            # レコードが0件の場合は、DB 不可達と本当に0件の場合を区別できないため、誤って録画ライブラリを全削除しないよう削除処理をスキップする
+            if len(records) == 0:
+                logging.info('EPGStation DB sync: enumerateRecords() returned 0 records. Skipping sync (no deletion).')
+                return
+
+            logging.info(f'EPGStation DB sync: enumerated {len(records)} records from EPGStation DB.')
+
+            # 今回同期でローカルパスに逆解決した (=KonomiTV 側で管理対象の) ファイルパスの集合
+            ## 削除の照合で「EPGStation DB に存在しない KonomiTV 側レコード」を特定するために利用する
+            ## 逆解決直後に追加するため、マッピング失敗で保存できなかったレコードの既存 KonomiTV レコードも誤削除から守られる
+            managed_file_paths: set[str] = set()
+
+            for record in records:
+                try:
+                    # 各 record ごとの例外は録画同期全体を落とさないよう try/except で包む
+
+                    # 1. dir_map を逆引きしてローカル絶対パスを構築 (対応しないレコードはスキップ)
+                    file_path = self._resolveLocalFilePathFromRecord(record)
+                    if file_path is None:
+                        continue
+                    # 逆解決できた時点で管理対象に追加する (マッピング失敗時も既存レコードの誤削除を防ぐため)
+                    managed_file_paths.add(file_path)
+
+                    # 2. ES DB の値から AV 未解析の占位 RecordedVideo を構築する (ファイル読み込みは一切行わない)
+                    ## startAt / endAt は Unix ミリ秒 (bigint) → JST の datetime
+                    file_created_at = datetime.fromtimestamp((record.startAt or 0) / 1000, tz=JST)
+                    file_modified_at = datetime.fromtimestamp((record.endAt or 0) / 1000, tz=JST)
+                    file_size = record.size if record.size is not None else 0
+                    # duration はミリ秒→秒に変換 (record.duration が None の場合は startAt/endAt 差分から算出を試みる)
+                    if record.duration is not None:
+                        duration = record.duration / 1000
+                    elif record.startAt is not None and record.endAt is not None:
+                        duration = (record.endAt - record.startAt) / 1000
+                    else:
+                        duration = 0.0
+
+                    # 占位 RecordedVideo (AV 各項目は Literal 制約を満たす合理的デフォルト値)
+                    ## file_hash='' は「AV 未解析」を表すセンチネル値 (B3 の遅延 ffprobe で上書きされる)
+                    placeholder_recorded_video = schemas.RecordedVideo(
+                        status = 'Recorded',
+                        file_path = file_path,
+                        file_hash = '',
+                        file_size = file_size,
+                        file_created_at = file_created_at,
+                        file_modified_at = file_modified_at,
+                        recording_start_time = None,
+                        recording_end_time = None,
+                        duration = duration,
+                        container_format = 'MPEG-TS',
+                        video_codec = 'MPEG-2',
+                        video_codec_profile = 'High',
+                        video_scan_type = 'Progressive',
+                        video_frame_rate = 29.97,
+                        video_resolution_width = 1920,
+                        video_resolution_height = 1080,
+                        has_video_stream_changes = False,
+                        primary_audio_codec = 'AAC-LC',
+                        primary_audio_channel = 'Stereo',
+                        primary_audio_sampling_rate = 48000,
+                        secondary_audio_codec = None,
+                        secondary_audio_channel = None,
+                        secondary_audio_sampling_rate = None,
+                        cm_sections = None,
+                        thumbnail_info = None,
+                        # 必須フィールドのため作成日時・更新日時は適当に現在時刻を入れている
+                        # この値は参照されず、DB の値は別途自動生成される
+                        created_at = datetime.now(tz=JST),
+                        updated_at = datetime.now(tz=JST),
+                    )
+
+                    # 3. EPGStationRecordedRecord → schemas.RecordedProgram にマッピング
+                    ## analyze_recording_time=False で TS ファイル読み込みを伴わない純 DB 同期とする
+                    program = EPGStationMetadataProvider.mapRecordToProgram(
+                        record = record,
+                        recorded_video = placeholder_recorded_video,
+                        analyze_recording_time = False,
+                    )
+                    # 必須フィールド欠損等でマッピングできなかったレコードはスキップ
+                    if program is None:
+                        continue
+
+                    # 4. 既に KonomiTV 側に同 file_path のレコードがあり、file_hash != '' (B3 で既に ffprobe 済み) の場合は、
+                    # その AV 実値 / file_hash / file_size / file_modified_at を占位値に上書きしないよう保持する
+                    ## AV 以外の EPG メタデータ (番組名/ジャンル/時刻など) は新しい値で更新する
+                    ## key_frames / segment_map / cm_sections / thumbnail_info は __saveRecordedMetadataToDB 側で
+                    ## 空配列/None にリセットされるため、ここでは保持対象外 (B3 の遅延解決で改めて算出される前提)
+                    existing = await RecordedVideo.get_or_none(file_path=file_path) \
+                        .select_related('recorded_program', 'recorded_program__channel')
+                    if existing is not None and existing.file_hash != '':
+                        program.recorded_video.file_hash = existing.file_hash
+                        program.recorded_video.file_size = existing.file_size
+                        program.recorded_video.file_modified_at = existing.file_modified_at
+                        program.recorded_video.container_format = existing.container_format
+                        program.recorded_video.video_codec = existing.video_codec
+                        program.recorded_video.video_codec_profile = existing.video_codec_profile
+                        program.recorded_video.video_scan_type = existing.video_scan_type
+                        program.recorded_video.video_frame_rate = existing.video_frame_rate
+                        program.recorded_video.video_resolution_width = existing.video_resolution_width
+                        program.recorded_video.video_resolution_height = existing.video_resolution_height
+                        program.recorded_video.primary_audio_codec = existing.primary_audio_codec
+                        program.recorded_video.primary_audio_channel = existing.primary_audio_channel
+                        program.recorded_video.primary_audio_sampling_rate = existing.primary_audio_sampling_rate
+                        program.recorded_video.secondary_audio_codec = existing.secondary_audio_codec
+                        program.recorded_video.secondary_audio_channel = existing.secondary_audio_channel
+                        program.recorded_video.secondary_audio_sampling_rate = existing.secondary_audio_sampling_rate
+                        # 録画時刻マージン (margins) 計算に必要な recording_start_time / recording_end_time も保持する
+                        ## 同期パスでは TOT 解析を行わない (analyze_recording_time=False) ため、未解析にならないよう既存値を引き継ぐ
+                        program.recorded_video.recording_start_time = existing.recording_start_time
+                        program.recorded_video.recording_end_time = existing.recording_end_time
+
+                    # 5. __saveRecordedMetadataToDB で upsert (既存レコード更新 / 新規作成)
+                    await self.__saveRecordedMetadataToDB(program, existing)
+                except Exception as ex:
+                    # 単一レコード処理の例外は同期全体を落とさないよう warning に留める
+                    logging.warning(
+                        f'EPGStation DB sync: Failed to sync record '
+                        f'(recorded.id={record.id}, parentDirectoryName={record.parentDirectoryName}, filePath={record.filePath}):',
+                        exc_info = ex,
+                    )
+
+            # 6. 削除の照合: EPGStation DB に存在しない (=同期漏れの) KonomiTV 側レコードを削除する
+            ## runBatchScan() @320-390 の削除パターンと同様、RecordedProgram を削除すれば CASCADE で RecordedVideo も削除される
+            ## ただし enumerateRecords() が空リストを返した場合は上記で既に return しているため、ここに到達時は ≥1 件同期済み
+            logging.info('EPGStation DB sync: Deleting records not present in EPGStation DB...')
+            async with transactions.in_transaction():
+                # DB に存在する全 RecordedVideo の (id, file_path, recorded_program_id) を取得
+                existing_video_rows = await RecordedVideo.all().values(
+                    'id',
+                    'file_path',
+                    'recorded_program_id',
+                )
+                for index, row in enumerate(existing_video_rows, start=1):
+                    if row['file_path'] not in managed_file_paths:
+                        # EPGStation DB に存在しない録画ファイルに対応する RecordedProgram を削除 (CASCADE で RecordedVideo も削除)
+                        await RecordedProgram.filter(id=row['recorded_program_id']).delete()
+                        logging.info(f'{row["file_path"]}: Deleted record not present in EPGStation DB.')
+                    # 大量レコード走査がイベントループを占有し続けないよう適宜制御を返す
+                    if index % 50 == 0:
+                        await asyncio.sleep(0)
+
+            logging.info('EPGStation DB sync has been completed.')
+
+        except Exception as ex:
+            # 同期全体の例外は KonomiTV の録画ライブラリを削除/破損しないよう、安全に終了する
+            logging.error('EPGStation DB sync failed.', exc_info=ex)
 
 
     async def runBatchScan(self) -> None:

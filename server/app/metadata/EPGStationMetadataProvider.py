@@ -72,7 +72,8 @@ class EPGStationMetadataProvider:
             )
 
             # 命中した生レコードを schemas.RecordedProgram にマッピングする
-            recorded_program = self._buildRecordedProgram(record)
+            ## マッピング処理は scan パスと B2 同期パスで共通利用できるよう staticmethod に切り出されている
+            recorded_program = self.mapRecordToProgram(record, self.recorded_video)
         except Exception as ex:
             # 取レコード/マッピング中に例外が発生した場合は録画スキャン全体を落とさないよう warning を出して None を返す
             ## (TSInfoAnalyzer にフォールバック)
@@ -85,12 +86,22 @@ class EPGStationMetadataProvider:
 
         return recorded_program
 
-    def _buildRecordedProgram(self, record: EPGStationRecordedRecord) -> schemas.RecordedProgram | None:
+    @staticmethod
+    def mapRecordToProgram(
+        record: EPGStationRecordedRecord,
+        recorded_video: schemas.RecordedVideo,
+        analyze_recording_time: bool = True,
+    ) -> schemas.RecordedProgram | None:
         """
-        命中した EPGStationRecordedRecord を schemas.RecordedProgram にマッピングする
+        EPGStationRecordedRecord を schemas.RecordedProgram にマッピングする
+        MetadataAnalyzer (scan パス) と RecordedScanTask.runEPGStationSync (B2 同期パス) の両方から共通利用される
 
         Args:
             record (EPGStationRecordedRecord): EPGStation の recorded / video_file テーブルから取得した生レコード
+            recorded_video (schemas.RecordedVideo): 結果の RecordedProgram.recorded_video に設定する録画ファイル情報
+                (scan パスでは ffprobe で得た実値、B2 同期パスでは AV 未解析の占位値を渡す)
+            analyze_recording_time (bool): 録画開始/終了時刻を TS の TOT から解析するかどうか (デフォルト: True)
+                scan パスでは True で従来通り、B2 同期パスでは False にしてファイル読み込みを伴わない純 DB 同期を実現する
 
         Returns:
             schemas.RecordedProgram | None: マッピング結果 (必須フィールドが取得できない場合は None)
@@ -98,12 +109,12 @@ class EPGStationMetadataProvider:
 
         # タイトルは必須フィールドのため、取得できなければマッピングを諦める (TSInfoAnalyzer にフォールバック)
         if record.name is None:
-            logging.warning(f'{self.recorded_video.file_path}: EPGStation record has no name. Skipping.')
+            logging.warning(f'{recorded_video.file_path}: EPGStation record has no name. Skipping.')
             return None
 
         # 番組開始時刻・番組終了時刻は必須フィールドのため、いずれか欠損時はマッピングを諦める
         if record.startAt is None or record.endAt is None:
-            logging.warning(f'{self.recorded_video.file_path}: EPGStation record has no startAt/endAt. Skipping.')
+            logging.warning(f'{recorded_video.file_path}: EPGStation record has no startAt/endAt. Skipping.')
             return None
 
         # EPGStation の startAt / endAt は Unix ミリ秒 (bigint)
@@ -130,33 +141,36 @@ class EPGStationMetadataProvider:
             event_id = record.programId % 100000
 
         # チャンネル情報を合成する (network_id / service_id が取得でき、かつ network_type が判別できる場合のみ)
-        channel = self._buildChannel(network_id, service_id) if (network_id is not None and service_id is not None) else None
+        channel = EPGStationMetadataProvider._buildChannel(recorded_video.file_path, network_id, service_id) \
+            if (network_id is not None and service_id is not None) else None
 
         # ジャンル情報を構築する
-        genres = self._buildGenres(record)
+        genres = EPGStationMetadataProvider._buildGenres(record)
 
         # 番組詳細情報 (detail) を構築する
-        detail = self._parseExtended(record.extended)
+        detail = EPGStationMetadataProvider._parseExtended(record.extended)
 
         # 録画開始時刻・録画終了時刻を TOT から解析して設定する (margins 精度向上のため)
         ## EPGStation DB には編成予定時刻しかないため、物理的な録画境界は録画 TS の TOT から取得する
         ## MetadataAnalyzer は EPGStation プロバイダ命中時には TSInfoAnalyzer を生成しないため、
         ## ここで自前で録画時刻を設定しておかないと下游の margins/is_partially_recorded 計算がスキップされる
         ## 解析失敗時はそのまま None (margins は安全にデフォルト 0 になる) となるよう try/except で包む
-        try:
-            recording_time = TSInfoAnalyzer(self.recorded_video).analyzeRecordingTime()
-            if recording_time is not None:
-                self.recorded_video.recording_start_time = recording_time[0]
-                self.recorded_video.recording_end_time = recording_time[1]
-        except Exception as ex:
-            logging.debug(
-                f'{self.recorded_video.file_path}: Failed to analyze recording time from TS for EPGStation metadata.',
-                exc_info = ex,
-            )
+        ## B2 同期パス (analyze_recording_time=False) ではファイル読み込みを伴う TSInfoAnalyzer の生成自体を行わない
+        if analyze_recording_time is True:
+            try:
+                recording_time = TSInfoAnalyzer(recorded_video).analyzeRecordingTime()
+                if recording_time is not None:
+                    recorded_video.recording_start_time = recording_time[0]
+                    recorded_video.recording_end_time = recording_time[1]
+            except Exception as ex:
+                logging.debug(
+                    f'{recorded_video.file_path}: Failed to analyze recording time from TS for EPGStation metadata.',
+                    exc_info = ex,
+                )
 
         # 録画番組情報を表すモデルを作成する (TSInfoAnalyzer.analyze() の返値と形状が一致するよう組み立てる)
         recorded_program = schemas.RecordedProgram(
-            recorded_video = self.recorded_video,
+            recorded_video = recorded_video,
             channel = channel,
             network_id = network_id,
             service_id = service_id,
@@ -179,13 +193,15 @@ class EPGStationMetadataProvider:
 
         return recorded_program
 
-    def _buildChannel(self, network_id: int, service_id: int) -> schemas.Channel | None:
+    @staticmethod
+    def _buildChannel(file_path: str, network_id: int, service_id: int) -> schemas.Channel | None:
         """
         network_id / service_id から schemas.Channel を合成する
         TSInfoAnalyzer.__analyzeSDTInformation() の 447-470 段と同じ枠組み・同じ TSInformation helper を使うが、
         TS から SDT/NIT を読むのではなく EPGStation の channelId 逆解決結果から直接構築する
 
         Args:
+            file_path (str): ログ出力用の録画ファイルパス
             network_id (int): EPGStation の channelId から逆解決した network_id
             service_id (int): EPGStation の channelId から逆解決した service_id
 
@@ -197,7 +213,7 @@ class EPGStationMetadataProvider:
         channel_type: Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K', 'OTHER'] = TSInformation.getNetworkType(network_id)
         if channel_type == 'OTHER':
             logging.warning(
-                f'{self.recorded_video.file_path}: Unknown network_id {network_id} from EPGStation channelId. '
+                f'{file_path}: Unknown network_id {network_id} from EPGStation channelId. '
                 f'Skipping channel synthesis.'
             )
             return None
@@ -253,7 +269,8 @@ class EPGStationMetadataProvider:
 
         return channel
 
-    def _buildGenres(self, record: EPGStationRecordedRecord) -> list[schemas.Genre]:
+    @staticmethod
+    def _buildGenres(record: EPGStationRecordedRecord) -> list[schemas.Genre]:
         """
         EPGStationRecordedRecord の genre1/subGenre1, genre2/subGenre2, genre3/subGenre3 を
         ariblib.constants.CONTENT_TYPE を使って schemas.Genre のリストにマッピングする
@@ -315,7 +332,8 @@ class EPGStationMetadataProvider:
 
         return genres
 
-    def _parseExtended(self, extended: str | None) -> dict[str, str]:
+    @staticmethod
+    def _parseExtended(extended: str | None) -> dict[str, str]:
         """
         EPGStation の extended (拡張描述テキスト) を KonomiTV の detail dict (見出し→本文) に変換する
 

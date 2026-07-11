@@ -251,6 +251,36 @@ class EPGStationDBClient:
             logging.debug(f'EPGStation DB findThumbnailId failed for {file_path}: {type(ex).__name__}: {ex}')
             return None
 
+    def enumerateRecords(self) -> list[EPGStationRecordedRecord]:
+        """
+        EPGStation の MariaDB から、録画済み (isRecording = 0) の全レコードを列挙する
+        B2 の DB 同期タスク (runEPGStationSync) で、フォルダスキャンを伴わずに KonomiTV の録画ライブラリを
+        EPGStation DB から直接構築するために利用する
+
+        Returns:
+            list[EPGStationRecordedRecord]: 録画済みレコードのリスト
+                (DB 不可達時やクエリ失敗時は空リストを返し、決して例外を投げない)
+        """
+
+        # 完了済みの録画 (r.isRecording = 0) のみを取得する
+        ## 録画中のレコードはファイルがまだ不完全なため同期対象から除外する
+        query = (
+            f'SELECT {self._SELECT_COLUMNS} '
+            'FROM video_file v JOIN recorded r ON r.id = v.recordedId '
+            'WHERE r.isRecording = 0'
+        )
+        try:
+            rows = self._executeQuery(query, ())
+            if rows is None:
+                # DB 接続エラー等でクエリ自体が実行できなかった場合は空リストを返す
+                return []
+            return [self._buildRecord(row) for row in rows]
+        except Exception as ex:
+            # このメソッドは読み取り専用かつ例外を投げないことが呼び出し元の前提のため、
+            # いかなる例外も握り潰して空リストを返す (DB 同期タスクを落とさないよう安全に振る舞う)
+            logging.warning(f'EPGStation DB enumerateRecords failed: {type(ex).__name__}: {ex}')
+            return []
+
     def findRecord(self, file_path: str, file_size: int) -> EPGStationRecordedRecord | None:
         """
         録画ファイルのローカル絶対パスとファイルサイズから、対応する EPGStation 側のレコードを取得する

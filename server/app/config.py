@@ -376,6 +376,9 @@ class _ServerSettingsEPGStationMetadata(BaseModel):
     # (本项目新增) EPGStation の HTTP API ベース URL (サムネイル画像のプロキシ取得に使用)
     ## 例: 'http://192.168.1.10:8888' 。末尾スラッシュはあってもなくてもよい (利用時に正規化する)
     url: str = ''
+    # (本项目新增) EPGStation DB 同期タスクのポーリング間隔 (秒)
+    ## enabled=true のとき、録画フォルダスキャンではなく EPGStation DB からの同期をこの間隔で定期的に行う
+    sync_interval: int = 300
 
 class ServerSettings(BaseModel):
     general: _ServerSettingsGeneral = _ServerSettingsGeneral()

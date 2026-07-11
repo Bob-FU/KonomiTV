@@ -216,14 +216,10 @@ class MetadataAnalyzer:
         self.recorded_file_path = recorded_file_path
 
 
-    def analyze(self) -> schemas.RecordedProgram | None:
+    def __analyzeAV_internal(self) -> tuple[schemas.RecordedVideo, FFprobeResult, int | None] | None:
         """
-        録画ファイル内のメタデータを解析する
-        このメソッドは同期的なため、非同期メソッドから実行する際は asyncio.to_thread() または ProcessPoolExecutor で実行すること
-
-        Returns:
-            schemas.RecordedProgram | None: 録画番組情報（中に録画ファイル情報・チャンネル情報が含まれる）を表すモデル
-                (KonomiTV で再生可能なファイルではない場合は None が返される)
+        内部的に FFprobe などを呼び出して録画ファイルの AV 情報を解析し、
+        schemas.RecordedVideo モデルとその取得結果を返す
         """
 
         def ParseFPS(fps_string: str | None) -> float | None:
@@ -524,6 +520,37 @@ class MetadataAnalyzer:
             created_at = now,
             updated_at = now,
         )
+
+        return recorded_video, full_probe, end_ts_offset
+
+    def analyzeAVMetadataOnly(self) -> schemas.RecordedVideo | None:
+        """
+        録画ファイルの AV メタデータ（映像・音声ストリーム情報など）のみを解析する
+        EPG 等の番組情報は解析しない（同期実行のため ProcessPoolExecutor などを利用すること）
+
+        Returns:
+            schemas.RecordedVideo | None: 解析済みの録画ファイル情報
+        """
+        av_result = self.__analyzeAV_internal()
+        if av_result is None:
+            return None
+        recorded_video, _, _ = av_result
+        return recorded_video
+
+    def analyze(self) -> schemas.RecordedProgram | None:
+        """
+        録画ファイル内のメタデータを解析する
+        このメソッドは同期的なため、非同期メソッドから実行する際は asyncio.to_thread() または ProcessPoolExecutor で実行すること
+
+        Returns:
+            schemas.RecordedProgram | None: 録画番組情報（中に録画ファイル情報・チャンネル情報が含まれる）を表すモデル
+                (KonomiTV で再生可能なファイルではない場合は None が返される)
+        """
+
+        av_result = self.__analyzeAV_internal()
+        if av_result is None:
+            return None
+        recorded_video, full_probe, end_ts_offset = av_result
 
         recorded_program = None
         # EPGStation の MariaDB から録画番組メタデータを取得する (機能が有効な場合のみ)
