@@ -353,10 +353,11 @@ class RecordedScanTask:
 
                     # 3. EPGStationRecordedRecord → schemas.RecordedProgram にマッピング
                     ## analyze_recording_time=False で TS ファイル読み込みを伴わない純 DB 同期とする
-                    program = EPGStationMetadataProvider.mapRecordToProgram(
-                        record = record,
-                        recorded_video = placeholder_recorded_video,
-                        analyze_recording_time = False,
+                    program = await asyncio.to_thread(
+                        EPGStationMetadataProvider.mapRecordToProgram,
+                        record,
+                        placeholder_recorded_video,
+                        False,  # analyze_recording_time
                     )
                     # 必須フィールド欠損等でマッピングできなかったレコードはスキップ
                     if program is None:
