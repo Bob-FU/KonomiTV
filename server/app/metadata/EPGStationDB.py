@@ -127,6 +127,9 @@ class EPGStationDBClient:
                 database = db_config.database,
                 charset = 'utf8mb4',
                 connect_timeout = 5,
+                # 読み取り専用クライアント。autocommit=True にしないと、永続接続 + REPEATABLE READ により
+                ## 最初のクエリ時のスナップショットが固定され、定期同期で EPGStation の新規録画が見えなくなる
+                autocommit = True,
                 cursorclass = pymysql.cursors.DictCursor,
             )
             _thread_local.connection = connection
