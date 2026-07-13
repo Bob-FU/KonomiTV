@@ -272,6 +272,27 @@ class Videos {
 
 
     /**
+     * 任意のローカルファイルを一時的な録画番組として登録する
+     * @param path ローカルファイルのパス
+     * @param hash ローカルファイルのパスに対する署名
+     * @returns 合成された録画番組 ID or 登録に失敗した場合は null
+     */
+    static async registerAdhocFile(path: string, hash: string): Promise<number | null> {
+
+        // API リクエストを実行
+        const response = await APIClient.post<{ id: number }>('/videos/adhoc', {path, hash});
+
+        // エラー処理
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'ローカルファイルを再生できませんでした。');
+            return null;
+        }
+
+        return response.data.id;
+    }
+
+
+    /**
      * 録画番組の放送中に投稿されたニコニコ実況の過去ログコメントを取得する
      * @param video_id 録画番組の ID
      * @returns 過去ログコメントのリスト

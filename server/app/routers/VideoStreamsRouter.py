@@ -13,6 +13,7 @@ from app import logging
 from app.metadata.MetadataAnalyzer import MetadataAnalyzer
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
+from app.streams import ArbitraryPlayer
 from app.streams.StreamEncodingOptions import (
     SplitQualityAndEncodingOptions,
     StreamQualityWithOptions,
@@ -33,6 +34,11 @@ _file_locks_dict_lock: asyncio.Lock = asyncio.Lock()
 
 async def ValidateVideoID(video_id: Annotated[int, Path(description='録画番組の ID 。')]) -> RecordedProgram:
     """ 録画番組 ID のバリデーション """
+
+    # 任意ローカルファイル再生のメモリ上番組情報を先に確認する
+    ephemeral_program = ArbitraryPlayer.get(video_id)
+    if ephemeral_program is not None:
+        return ephemeral_program
 
     # 指定された video_id が存在するか確認
     recorded_program = await RecordedProgram.filter(id=video_id).get_or_none() \

@@ -354,6 +354,11 @@ class _ServerSettingsVideo(BaseModel):
 class _ServerSettingsCapture(BaseModel):
     upload_folders: list[DirectoryPath] = []
 
+class _ServerSettingsArbitraryPlayer(BaseModel):
+    # 署名付き URL で任意のローカルファイルを再生する機能の設定
+    enabled: bool = False
+    salt: str = ''
+
 class _ServerSettingsEPGStationMetadataDB(BaseModel):
     # EPGStation の MariaDB 接続情報
     ## enabled=false のときは接続されないため、各値は空文字でも起動できるようデフォルト値を設定している
@@ -386,6 +391,7 @@ class ServerSettings(BaseModel):
     tv: _ServerSettingsTV = _ServerSettingsTV()
     video: _ServerSettingsVideo = _ServerSettingsVideo()
     capture: _ServerSettingsCapture = _ServerSettingsCapture()
+    arbitrary_player: _ServerSettingsArbitraryPlayer = _ServerSettingsArbitraryPlayer()
     epgstation_metadata: _ServerSettingsEPGStationMetadata = _ServerSettingsEPGStationMetadata()
 
 

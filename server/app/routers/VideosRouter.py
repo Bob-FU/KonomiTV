@@ -21,6 +21,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from starlette.datastructures import Headers
 from tortoise import connections
 
@@ -34,6 +35,7 @@ from app.metadata.TSInfoAnalyzer import TSInfoAnalyzer
 from app.models.RecordedProgram import RecordedProgram
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentAdminUser
+from app.streams import ArbitraryPlayer
 from app.utils.DriveIOLimiter import DriveIOLimiter
 from app.utils.JikkyoClient import JikkyoClient
 
@@ -61,6 +63,15 @@ _EPGSTATION_THUMBNAIL_ID_CACHE_LIMIT = 512
 # EPGStation からのプロキシ時に許容する Content-Type の白リスト (大文字小文字区別なし、; 以降のパラメータは無視)
 ## 上流が text/html 等を返した場合に XSS リスクを防ぐため、画像以外はデフォルトサムネイルにフォールバックする
 _EPGSTATION_ALLOWED_CONTENT_TYPES = frozenset({'image/jpeg', 'image/png', 'image/webp', 'image/gif'})
+
+
+class AdhocVideoRequest(BaseModel):
+    path: str
+    hash: str
+
+
+class AdhocVideoResponse(BaseModel):
+    id: int
 
 
 async def ConvertRowToRecordedProgram(row: dict[str, Any]) -> schemas.RecordedProgram:
@@ -169,6 +180,11 @@ async def ConvertRowToRecordedProgram(row: dict[str, Any]) -> schemas.RecordedPr
 
 async def GetRecordedProgram(video_id: Annotated[int, Path(description='録画番組の ID 。')]) -> RecordedProgram:
     """ 録画番組 ID から録画番組情報を取得する """
+
+    # 任意ローカルファイル再生のメモリ上番組情報を先に確認する
+    ephemeral_program = ArbitraryPlayer.get(video_id)
+    if ephemeral_program is not None:
+        return ephemeral_program
 
     # 録画番組情報を取得
     recorded_program = await RecordedProgram.all() \
@@ -752,6 +768,43 @@ async def VideosSearchAPI(
         )
 
 
+@router.post(
+    '/adhoc',
+    summary = '任意ローカルファイル登録 API',
+    response_model = AdhocVideoResponse,
+)
+async def AdhocVideoAPI(request: AdhocVideoRequest) -> AdhocVideoResponse:
+    """
+    署名付き URL で指定されたローカルファイルを一時的な録画番組として登録する。
+
+    オフラインで署名を生成する例:
+    python3 -c 'import hmac,hashlib,sys; print(hmac.new(sys.argv[1].encode(), sys.argv[2].encode(), hashlib.sha256).hexdigest())' "$SALT" "/絶対/パス.m2ts"
+    """
+
+    if Config().arbitrary_player.enabled is False:
+        raise HTTPException(
+            status_code = status.HTTP_404_NOT_FOUND,
+            detail = 'Arbitrary player is disabled',
+        )
+
+    if ArbitraryPlayer.verify_signature(request.path, request.hash) is False:
+        raise HTTPException(
+            status_code = status.HTTP_403_FORBIDDEN,
+            detail = 'Invalid file signature',
+        )
+
+    ephemeral_program = await ArbitraryPlayer.build_ephemeral_program(request.path)
+    if ephemeral_program is None:
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Specified file could not be analyzed or played',
+        )
+
+    recorded_program, recorded_program_schema = ephemeral_program
+    video_id = ArbitraryPlayer.register(recorded_program, recorded_program_schema)
+    return AdhocVideoResponse(id = video_id)
+
+
 @router.get(
     '/{video_id}',
     summary = '録画番組 API',
@@ -764,6 +817,11 @@ async def VideoAPI(
     """
     指定された録画番組を取得する。
     """
+
+    # 未保存 ORM のレスポンスシリアライズを避け、登録時に保存したスキーマを返す
+    ephemeral_program_schema = ArbitraryPlayer.get_schema(recorded_program.id)
+    if ephemeral_program_schema is not None:
+        return ephemeral_program_schema
 
     return recorded_program
 
@@ -909,6 +967,12 @@ async def VideoReanalyzeAPI(
     指定された録画番組のメタデータ（動画情報・番組情報・サムネイル画像・CM 区間情報など）をすべて再解析・再生成する。
     """
 
+    if ArbitraryPlayer.get_schema(recorded_program.id) is not None:
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Temporary files do not support metadata reanalysis',
+        )
+
     try:
         file_path = anyio.Path(recorded_program.recorded_video.file_path)
         # メタデータ再解析を実行
@@ -989,6 +1053,12 @@ async def VideoThumbnailRegenerateAPI(
     サムネイル画像の再生成には数分程度かかる場合がある。
     """
 
+    if ArbitraryPlayer.get_schema(recorded_program.id) is not None:
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = '一時的な任意ファイル再生の録画はサムネイルを再生成できません。',
+        )
+
     # EPGStation 連携が有効な場合は、ローカルのサムネイルを自主生成していないため no-op とする
     ## 204 No Content を返して成功パスと同じ挙動を保つ
     if Config().epgstation_metadata.enabled:
@@ -1032,6 +1102,12 @@ async def VideoDeleteAPI(
 
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
     """
+
+    if ArbitraryPlayer.get_schema(recorded_program.id) is not None:
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = '一時的な任意ファイル再生の録画は削除できません。',
+        )
 
     # 録画ファイルの情報を取得
     file_path = anyio.Path(recorded_program.recorded_video.file_path)
