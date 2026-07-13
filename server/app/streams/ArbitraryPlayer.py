@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from app import logging, schemas
 from app.config import Config
 from app.metadata.MetadataAnalyzer import MetadataAnalyzer
+from app.metadata.TSInfoAnalyzer import TSInfoAnalyzer
+from app.models.Channel import Channel
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
 from app.utils import ShutdownProcessPoolExecutor
@@ -40,6 +42,36 @@ class EphemeralEntry:
 _registry: dict[int, EphemeralEntry] = {}
 _registry_lock = threading.Lock()
 _id_counter = itertools.count(EPHEMERAL_ID_BASE)
+
+
+def _analyze_arbitrary_file(real_path: str) -> schemas.RecordedProgram | None:
+    """ProcessPoolExecutor 内で実行。analyze() に加え、MPEG-TS では EIT 非依存でチャンネル(SDT)/録画時刻(TOT)を補完する。"""
+
+    analyzed = MetadataAnalyzer(pathlib.Path(real_path)).analyze()
+    if analyzed is None:
+        return None
+
+    recorded_video = analyzed.recorded_video
+    if recorded_video.container_format == 'MPEG-TS':
+        # analyze() が EIT 失敗で channel を捨てた場合、SDT から復元
+        if analyzed.channel is None:
+            try:
+                channel = TSInfoAnalyzer(recorded_video).analyzeChannel()
+                if channel is not None:
+                    analyzed.channel = channel
+            except Exception:
+                pass
+
+        # 録画開始/終了時刻を TOT から補完 (EIT 非依存)
+        if recorded_video.recording_start_time is None or recorded_video.recording_end_time is None:
+            try:
+                recording_time = TSInfoAnalyzer(recorded_video).analyzeRecordingTime()
+                if recording_time is not None:
+                    recorded_video.recording_start_time, recorded_video.recording_end_time = recording_time
+            except Exception:
+                pass
+
+    return analyzed
 
 
 def _remove_expired(now: float) -> None:
@@ -141,7 +173,6 @@ async def build_ephemeral_program(
     if os.path.isfile(real_path) is False:
         return None
 
-    analyzer = MetadataAnalyzer(pathlib.Path(real_path))
     loop = asyncio.get_running_loop()
 
     async with ProcessLimiter.getSemaphore('ArbitraryPlayer'):
@@ -149,7 +180,7 @@ async def build_ephemeral_program(
         should_wait_executor = True
 
         try:
-            analyzed_program = await loop.run_in_executor(executor, analyzer.analyze)
+            analyzed_program = await loop.run_in_executor(executor, _analyze_arbitrary_file, real_path)
         except asyncio.CancelledError:
             should_wait_executor = False
             await ShutdownProcessPoolExecutor(executor, is_cancelled=True)
@@ -170,10 +201,34 @@ async def build_ephemeral_program(
     program.recording_start_margin = analyzed_program.recording_start_margin
     program.recording_end_margin = analyzed_program.recording_end_margin
     program.is_partially_recorded = analyzed_program.is_partially_recorded
-    program.channel = None
-    program.channel_id = None
     program.network_id = analyzed_program.network_id
     program.service_id = analyzed_program.service_id
+    if analyzed_program.channel is not None:
+        # RecordedScanTask.__populateChannelModelFromSchema と同等の写し (未保存 ORM)
+        channel = Channel()
+        channel.id = analyzed_program.channel.id
+        channel.display_channel_id = analyzed_program.channel.display_channel_id
+        channel.network_id = analyzed_program.channel.network_id
+        channel.service_id = analyzed_program.channel.service_id
+        channel.transport_stream_id = analyzed_program.channel.transport_stream_id
+        channel.remocon_id = analyzed_program.channel.remocon_id
+        channel.channel_number = analyzed_program.channel.channel_number
+        channel.type = analyzed_program.channel.type
+        channel.name = analyzed_program.channel.name
+        channel.jikkyo_force = analyzed_program.channel.jikkyo_force
+        channel.is_subchannel = analyzed_program.channel.is_subchannel
+        channel.is_radiochannel = analyzed_program.channel.is_radiochannel
+        channel.is_watchable = analyzed_program.channel.is_watchable
+        program.channel = channel
+        program.channel_id = channel.id
+        # program 側の network_id/service_id も未設定なら channel から補完
+        if program.network_id is None:
+            program.network_id = channel.network_id
+        if program.service_id is None:
+            program.service_id = channel.service_id
+    else:
+        program.channel = None
+        program.channel_id = None
     program.event_id = analyzed_program.event_id
     program.series = None
     program.series_id = None

@@ -192,6 +192,14 @@ class TSInfoAnalyzer:
         return recorded_program
 
 
+    def analyzeChannel(self) -> schemas.Channel | None:
+        """
+        SDT からチャンネル情報のみを解析する。
+        analyze() と異なり EIT(番組情報) に依存しないため、EIT を取得できないファイルでもチャンネルを復元できる。
+        """
+        return self.__analyzeSDTInformation()
+
+
     def analyzeRecordingTime(self) -> tuple[datetime, datetime] | None:
         """
         TOT (Time Offset Table) から録画開始時刻と録画終了時刻を解析する
