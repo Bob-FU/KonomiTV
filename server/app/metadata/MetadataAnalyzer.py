@@ -570,7 +570,7 @@ class MetadataAnalyzer:
                 logging.debug(f'{self.recorded_file_path}: EPGStation metadata analysis completed.')
         # プロバイダがメタデータを取得できなかった場合のみ、TSInfoAnalyzer で SDT/EIT 解析を行う
         if recorded_program is None:
-            if container_format == 'MPEG-TS':
+            if recorded_video.container_format == 'MPEG-TS':
                 # FFprobe の programs 配列から、実際にストリームが存在する service_id を特定する
                 ## 複数サービスを含む TS ファイル (CS放送やマルチ編成) では、PAT に複数のサービスが含まれている場合がある
                 ## FFprobe は実際のストリーム構成を解析するため、nb_streams > 0 かつ pcr_pid > 0 の program_id が
@@ -601,7 +601,7 @@ class MetadataAnalyzer:
                         recorded_video.recording_end_time = recording_time[1]
                 else:
                     # 取得失敗時、最終更新日時が現在時刻から30秒以内ならまだ録画中の可能性が高いので、None を返し DB には保存しない
-                    if (now - recorded_video.file_modified_at).total_seconds() < 30:
+                    if (datetime.now(tz=JST) - recorded_video.file_modified_at).total_seconds() < 30:
                         logging.warning(f'{self.recorded_file_path}: MPEG-TS SDT/EIT analysis failed. (still recording?)')
                         return None
             else:
@@ -609,7 +609,7 @@ class MetadataAnalyzer:
                 analyzer = TSInfoAnalyzer(recorded_video)
                 recorded_program = analyzer.analyze()  # 取得失敗時は None が返る
                 if recorded_program is not None:
-                    logging.debug(f'{self.recorded_file_path}: {container_format} Service/Event analysis completed.')
+                    logging.debug(f'{self.recorded_file_path}: {recorded_video.container_format} Service/Event analysis completed.')
                     # 取得成功時は録画開始時刻と録画終了時刻も解析する
                     recording_time = analyzer.analyzeRecordingTime()
                     if recording_time is not None:
