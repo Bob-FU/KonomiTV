@@ -231,7 +231,9 @@ async def build_ephemeral_program(
     recorded_video.updated_at = recorded_video_schema.updated_at
 
     # 未保存の ORM 同士を明示的に双方向へ紐付ける
-    program.recorded_video = recorded_video
+    ## recorded_video は逆参照 OneToOne（related_name）で読取専用プロパティ（setter なし）のため、
+    ## select_related と同じく Tortoise 内部のキャッシュ属性 _recorded_video に直接代入する
+    program._recorded_video = recorded_video
     recorded_video.recorded_program = program
     recorded_video.recorded_program_id = program.id
 
