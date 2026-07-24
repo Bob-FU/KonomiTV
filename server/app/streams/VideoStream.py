@@ -82,7 +82,9 @@ class VideoStream:
 
     # 録画視聴セッションが再生されていない場合にタイムアウトするまでの時間 (秒)
     # この時間が経過すると、録画視聴セッションのインスタンスは自動的に破棄される
-    SESSION_TIMEOUT: ClassVar[float] = float(10)  # 10 秒
+    # モバイル Safari では前面再生中でも、Wi-Fi 省電力やタイマー抑制により keep-alive が 10 秒以上途切れることがある
+    # ため、余裕を持たせている。トレードオフとして、視聴終了後もエンコーダが最大 120 秒残る
+    SESSION_TIMEOUT: ClassVar[float] = float(120)  # 120 秒
 
     # 一度でも読み取られた HLS セグメントの最大保持数
     MAX_READED_SEGMENTS: ClassVar[int] = 10

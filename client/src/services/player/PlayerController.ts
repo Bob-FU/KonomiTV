@@ -67,6 +67,22 @@ class PlayerController {
     // ビデオ視聴: ビデオストリームのアクティブ状態を維持するために Keep-Alive API にリクエストを送るインターバルのキャンセルする関数
     private video_keep_alive_interval_timer_cancel: (() => void) | null = null;
 
+    // ビデオ視聴: HLS セッション復旧で使用する HLS プラグインとイベントハンドラー
+    // 画質切り替えで HLS プラグインが入れ替わるため、破棄時に確実に解除できるよう保持しておく
+    private video_session_recovery_hls_plugin: Hls | null = null;
+    private video_session_recovery_error_handler: ((event: string, data: any) => void) | null = null;
+    private video_session_recovery_frag_buffered_handler: (() => void) | null = null;
+
+    // ビデオ視聴: HLS セッション復旧の多重起動・ループを防止する状態
+    private video_session_recovery_in_progress = false;
+    private video_session_recovery_attempt_count = 0;
+    private video_session_recovery_window_started_at = 0;
+    private video_session_recovery_last_attempt_at = 0;
+    private video_session_recovery_current_cache_key: string | null = null;
+    private video_session_recovery_buffered_count = 0;
+    private video_session_media_error_recovery_attempted = false;
+    private video_session_recovery_disabled = false;
+
     // setupPlayerContainerResizeHandler() で利用する ResizeObserver
     // 保持しておかないと disconnect() で ResizeObserver を止められない
     private player_container_resize_observer: ResizeObserver | null = null;
@@ -1078,6 +1094,220 @@ class PlayerController {
 
 
     /**
+     * ビデオ視聴: HLS セッション復旧用のイベントハンドラーを登録する
+     */
+    private setupVideoSessionRecoveryHandler(hls_plugin: Hls): void {
+
+        // 画質切り替え時に以前の HLS プラグインへ登録したイベントを解除する
+        this.removeVideoSessionRecoveryHandler();
+        this.resetVideoSessionRecoveryState();
+
+        this.video_session_recovery_hls_plugin = hls_plugin;
+
+        // hls.js の fatal エラーから、セッション消滅などの復旧可能なエラーを検知する
+        this.video_session_recovery_error_handler = (_event: string, data: any) => {
+
+            // DPlayer が破棄済み、または自動復旧を断念済みなら何もしない
+            if (this.player === null || this.destroyed === true || this.destroying === true || this.video_session_recovery_disabled === true) {
+                return;
+            }
+
+            // fatal でないエラーは hls.js 内部のリトライに任せる
+            if (data.fatal !== true) {
+                return;
+            }
+
+            // NETWORK_ERROR の URL が取得できる場合は cache_key を比較し、旧セッションの残骸リクエストか判定する
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR && this.video_session_recovery_in_progress === true) {
+                // hls.js のエラー payload にはバージョンやエラー種別により URL の格納場所が異なるため、候補を順に確認する
+                const error_url = typeof data.frag?.url === 'string' ? data.frag.url :
+                    typeof data.context?.url === 'string' ? data.context.url :
+                        typeof data.networkDetails?.responseURL === 'string' ? data.networkDetails.responseURL :
+                            typeof data.url === 'string' ? data.url : null;
+
+                // プレイリスト再取得直後は旧 cache_key の in-flight リクエストが fatal になることがある
+                // 現在の cache_key を含まない URL は旧セッションの残骸と判断し、復旧試行の失敗として数えない
+                if (error_url !== null && this.video_session_recovery_current_cache_key !== null &&
+                    error_url.includes(`cache_key=${this.video_session_recovery_current_cache_key}`) === false) {
+                    // fatal エラーで hls.js が停止している可能性があるため、カウンタを変更せず startLoad() だけを保険として実行する
+                    // 旧リクエストを無視しても新しいプレイリストのロードまで止まらないようにする
+                    hls_plugin.startLoad();
+                    return;
+                }
+            }
+
+            // 現在の cache_key のエラー、URL を取得できないエラー、または復旧中でないエラーは通常どおり扱う
+            // 復旧中に再び fatal になった場合は、現在の復旧試行が失敗したとみなして次の試行を許可する
+            const recovery_was_in_progress = this.markVideoSessionRecoveryFailed();
+
+            // MEDIA_ERROR は、まず hls.js 標準のメディア復旧を1回だけ試す
+            // 短時間に再発した場合は、セッションが消滅した可能性があるためプレイリストを再取得する
+            if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                if (recovery_was_in_progress === true || this.video_session_media_error_recovery_attempted === true) {
+                    this.recoverVideoSession(hls_plugin);
+                } else {
+                    this.video_session_media_error_recovery_attempted = true;
+                    console.warn('\u001b[31m[PlayerController] hls.js fatal MEDIA_ERROR. Trying recoverMediaError().');
+                    hls_plugin.recoverMediaError();
+                }
+                return;
+            }
+
+            // セッション消滅時の 422 などの NETWORK_ERROR は、プレイリスト再取得による復旧を試みる
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                this.recoverVideoSession(hls_plugin);
+                return;
+            }
+
+            // その他の fatal エラーも、無言で停止させず同じ復旧処理へ進める
+            this.recoverVideoSession(hls_plugin);
+        };
+
+        // プレイリスト再取得後にフラグメントを2回受信できたら、復旧成功としてループ防止カウンタをリセットする
+        this.video_session_recovery_frag_buffered_handler = () => {
+            if (this.video_session_recovery_in_progress === false) {
+                // 通常の再生でフラグメントを受信できているため、MEDIA_ERROR の標準復旧は成功したとみなす
+                this.video_session_media_error_recovery_attempted = false;
+                return;
+            }
+
+            this.video_session_recovery_buffered_count++;
+            if (this.video_session_recovery_buffered_count < 2) {
+                return;
+            }
+
+            this.video_session_recovery_in_progress = false;
+            this.video_session_recovery_attempt_count = 0;
+            this.video_session_recovery_window_started_at = 0;
+            this.video_session_recovery_buffered_count = 0;
+            this.video_session_media_error_recovery_attempted = false;
+            console.log('\u001b[31m[PlayerController] Video playback session recovered.');
+        };
+
+        const error_handler = this.video_session_recovery_error_handler;
+        const frag_buffered_handler = this.video_session_recovery_frag_buffered_handler;
+        assert(error_handler !== null);
+        assert(frag_buffered_handler !== null);
+        hls_plugin.on(Hls.Events.ERROR, error_handler);
+        hls_plugin.on(Hls.Events.FRAG_BUFFERED, frag_buffered_handler);
+    }
+
+
+    /**
+     * ビデオ視聴: HLS セッション復旧用のイベントハンドラーを解除する
+     */
+    private removeVideoSessionRecoveryHandler(): void {
+        if (this.video_session_recovery_hls_plugin !== null) {
+            if (this.video_session_recovery_error_handler !== null) {
+                this.video_session_recovery_hls_plugin.off(Hls.Events.ERROR, this.video_session_recovery_error_handler);
+            }
+            if (this.video_session_recovery_frag_buffered_handler !== null) {
+                this.video_session_recovery_hls_plugin.off(Hls.Events.FRAG_BUFFERED, this.video_session_recovery_frag_buffered_handler);
+            }
+        }
+        this.video_session_recovery_hls_plugin = null;
+        this.video_session_recovery_error_handler = null;
+        this.video_session_recovery_frag_buffered_handler = null;
+    }
+
+
+    /**
+     * ビデオ視聴: HLS セッション復旧の状態を初期化する
+     */
+    private resetVideoSessionRecoveryState(): void {
+        this.video_session_recovery_in_progress = false;
+        this.video_session_recovery_attempt_count = 0;
+        this.video_session_recovery_window_started_at = 0;
+        this.video_session_recovery_last_attempt_at = 0;
+        this.video_session_recovery_current_cache_key = null;
+        this.video_session_recovery_buffered_count = 0;
+        this.video_session_media_error_recovery_attempted = false;
+        this.video_session_recovery_disabled = false;
+    }
+
+
+    /**
+     * ビデオ視聴: keep-alive 422 を復旧開始直後のノイズとして無視するか判断する
+     */
+    private shouldIgnoreRecoveryTrigger(): boolean {
+        if (this.video_session_recovery_in_progress === false) {
+            return false;
+        }
+
+        // プレイリスト再取得直後は、復旧要求がサーバーへ届く前の keep-alive 422 が発生することがある
+        // keep-alive は hls.js のローディングを停止させないため、5秒間は復旧試行の失敗として数えない
+        return Date.now() - this.video_session_recovery_last_attempt_at < 5 * 1000;
+    }
+
+
+    /**
+     * ビデオ視聴: 復旧中に新しい確定エラーが発生した場合、現在の復旧試行を失敗として扱う
+     */
+    private markVideoSessionRecoveryFailed(): boolean {
+        const recovery_was_in_progress = this.video_session_recovery_in_progress;
+        if (recovery_was_in_progress === true) {
+            this.video_session_recovery_in_progress = false;
+            this.video_session_recovery_buffered_count = 0;
+        }
+        return recovery_was_in_progress;
+    }
+
+
+    /**
+     * ビデオ視聴: HLS プレイリストを再取得して、消滅した録画視聴セッションを復旧する
+     */
+    private recoverVideoSession(hls_plugin: Hls): void {
+
+        // Live は mpegts.js なので対象外。また、破棄中や復旧処理中は何もしない
+        if (this.playback_mode !== 'Video' || this.player === null || this.destroyed === true || this.destroying === true ||
+            this.video_session_recovery_in_progress === true || this.video_session_recovery_disabled === true) {
+            return;
+        }
+
+        // HLS プラグインの URL が未設定の場合は復旧できないため、カウンタ類を変更せず終了する
+        if (hls_plugin.url === null || hls_plugin.url === undefined || hls_plugin.url === '') {
+            console.warn('\u001b[31m[PlayerController] Cannot recover video session: hls.js url is not set.');
+            return;
+        }
+
+        const now = Date.now();
+        // 30秒を超えたら新しい復旧ウィンドウとしてカウンタを数え直す
+        if (this.video_session_recovery_window_started_at === 0 ||
+            now - this.video_session_recovery_window_started_at > 30 * 1000) {
+            this.video_session_recovery_window_started_at = now;
+            this.video_session_recovery_attempt_count = 0;
+        }
+
+        // 30秒以内の復旧試行が3回を超えた場合は、以後の自動復旧を断念する
+        if (this.video_session_recovery_attempt_count >= 3) {
+            this.video_session_recovery_disabled = true;
+            this.video_session_recovery_in_progress = false;
+            this.player.notice('再生セッションの復旧に失敗しました。ページを再読み込みしてください。');
+            console.warn('\u001b[31m[PlayerController] Video playback session recovery failed too many times.');
+            return;
+        }
+
+        this.video_session_recovery_last_attempt_at = now;
+        this.video_session_recovery_attempt_count++;
+        this.video_session_recovery_in_progress = true;
+        this.video_session_recovery_buffered_count = 0;
+
+        // cache_key を更新して Safari の HTTP キャッシュに残った古いプレイリスト・セグメント応答を避ける
+        const url = new URL(hls_plugin.url!);
+        const cache_key = crypto.randomUUID().split('-')[0];
+        this.video_session_recovery_current_cache_key = cache_key;
+        url.searchParams.set('cache_key', cache_key);
+        hls_plugin.trigger(Hls.Events.MANIFEST_LOADING, { url: url.toString() });
+
+        // fatal エラー後は hls.js がローディングを停止するため、公開 API の startLoad() も呼び出す
+        // hls.js 1.6.9 の fatal NETWORK_ERROR に対する標準復旧手順が startLoad() であり、MANIFEST_LOADING の手動トリガーだけでは
+        // 停止状態から再開しない可能性があるため、プレイリスト再取得と併用する
+        hls_plugin.startLoad();
+        console.warn(`\u001b[31m[PlayerController] Recovering video playback session. (Attempt: ${this.video_session_recovery_attempt_count}/3)`);
+    }
+
+
+    /**
      * DPlayer に動画再生系のイベントハンドラーを登録する
      * 特にライブ視聴ではここで適切に再生状態の管理 (再生可能かどうか、エラーが発生していないかなど) を行う必要がある
      */
@@ -1110,7 +1340,23 @@ class PlayerController {
                 if (this.player === null) return;
                 const api_quality = PlayerUtils.extractVideoAPIQualityFromDPlayer(this.player);
                 const session_id = PlayerUtils.extractSessionIdFromDPlayer(this.player);
-                await APIClient.put(`${Utils.api_base_url}/streams/video/${player_store.recorded_program.id}/${api_quality}/keep-alive?session_id=${session_id}`);
+                const response = await APIClient.put(`${Utils.api_base_url}/streams/video/${player_store.recorded_program.id}/${api_quality}/keep-alive?session_id=${session_id}`);
+
+                // HTTP 422 はサーバーが録画視聴セッションの消滅を明言しているため、hls.js のリトライ枯渇を待たずに復旧する
+                // ステータスコードを取得できない一時的な通信失敗では、セッションが生きている可能性があるので復旧しない
+                if (response.type === 'error' && response.status === 422 && this.player !== null) {
+                    const hls_plugin = this.player.plugins.hls;
+                    if (hls_plugin !== undefined) {
+                        // 復旧開始直後の旧セッション由来の 422 はノイズなので、現在の復旧処理を継続する
+                        if (this.shouldIgnoreRecoveryTrigger() === true) {
+                            return;
+                        }
+
+                        // 復旧中に 422 が返った場合は、現在の復旧試行が失敗したとみなして次の試行を許可する
+                        this.markVideoSessionRecoveryFailed();
+                        this.recoverVideoSession(hls_plugin);
+                    }
+                }
             }, 5 * 1000);
         }
 
@@ -1389,6 +1635,9 @@ class PlayerController {
                 // こうすることで startPosition を指定しつつ、シーク時は従来通りシーク先のセグメントから先読みが開始されるようになる
                 const hls_plugin = this.player.plugins.hls;
                 if (hls_plugin !== undefined) {
+                    // ビデオ視聴では HLS の fatal エラーと Keep-Alive の 422 から録画視聴セッションを自動復旧する
+                    this.setupVideoSessionRecoveryHandler(hls_plugin);
+
                     const resetStartPosition = () => {
                         hls_plugin.off(Hls.Events.FRAG_BUFFERED, resetStartPosition);
                         hls_plugin.config.startPosition = -1;
@@ -1407,6 +1656,10 @@ class PlayerController {
                     };
                     hls_plugin.on(Hls.Events.FRAG_BUFFERED, resetStartPosition);
                 } else {
+                    // Native HLS では hls.js のイベントを利用できないため、以前のリスナーと状態を解除する
+                    this.removeVideoSessionRecoveryHandler();
+                    this.resetVideoSessionRecoveryState();
+
                     // 実はなぜか hls.js を使わずとも Safari では普通に Native HLS 再生できてしまうようなので、警告を出しつつ何もしない
                     // DPlayer 側の機能により、Native HLS 再生であっても字幕は表示される
                     console.warn('\u001b[31m[PlayerController] hls.js plugin not found. (Native HLS playback may be supported on Safari.)');
@@ -2133,6 +2386,10 @@ class PlayerController {
             this.video_keep_alive_interval_timer_cancel();
             this.video_keep_alive_interval_timer_cancel = null;
         }
+
+        // HLS セッション復旧用のイベントハンドラーと状態を破棄
+        this.removeVideoSessionRecoveryHandler();
+        this.resetVideoSessionRecoveryState();
         window.clearTimeout(this.watched_history_threshold_timer_id);
         window.clearTimeout(this.player_control_ui_hide_timer_id);
 
