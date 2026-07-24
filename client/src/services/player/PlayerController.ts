@@ -67,6 +67,10 @@ class PlayerController {
     // ビデオ視聴: ビデオストリームのアクティブ状態を維持するために Keep-Alive API にリクエストを送るインターバルのキャンセルする関数
     private video_keep_alive_interval_timer_cancel: (() => void) | null = null;
 
+    // ビデオ視聴: pagehide イベントで録画視聴セッションを終了するためのイベントハンドラー
+    // destroy() で確実に解除するため保持しておく
+    private video_session_pagehide_handler: ((event: PageTransitionEvent) => void) | null = null;
+
     // ビデオ視聴: HLS セッション復旧で使用する HLS プラグインとイベントハンドラー
     // 画質切り替えで HLS プラグインが入れ替わるため、破棄時に確実に解除できるよう保持しておく
     private video_session_recovery_hls_plugin: Hls | null = null;
@@ -1254,6 +1258,30 @@ class PlayerController {
 
 
     /**
+     * ビデオ視聴: 録画視聴セッションの終了をサーバーへ通知する
+     */
+    private sendVideoSessionTerminateBeacon(): void {
+        if (this.playback_mode !== 'Video' || this.player === null) {
+            return;
+        }
+        if (typeof navigator.sendBeacon !== 'function') {
+            return;
+        }
+
+        const player_store = usePlayerStore();
+        const api_quality = PlayerUtils.extractVideoAPIQualityFromDPlayer(this.player);
+        const session_id = PlayerUtils.extractSessionIdFromDPlayer(this.player);
+        if (!player_store.recorded_program || api_quality === null || api_quality === undefined ||
+            session_id === null || session_id === undefined) {
+            return;
+        }
+
+        const url = `${Utils.api_base_url}/streams/video/${player_store.recorded_program.id}/${api_quality}/terminate?session_id=${session_id}`;
+        navigator.sendBeacon(url);
+    }
+
+
+    /**
      * ビデオ視聴: HLS プレイリストを再取得して、消滅した録画視聴セッションを復旧する
      */
     private recoverVideoSession(hls_plugin: Hls): void {
@@ -1358,6 +1386,13 @@ class PlayerController {
                     }
                 }
             }, 5 * 1000);
+
+            // pagehide は通常の離脱だけでなく bfcache 行き (event.persisted === true) でも発火するため、どちらでも終了を通知する
+            // bfcache から復帰した場合にセッションが既に破棄されていても、keep-alive 422 検知による自動復旧で再構築できる
+            this.video_session_pagehide_handler = (_event: PageTransitionEvent) => {
+                this.sendVideoSessionTerminateBeacon();
+            };
+            window.addEventListener('pagehide', this.video_session_pagehide_handler);
         }
 
         // 再生/停止されたときのイベント
@@ -2386,6 +2421,14 @@ class PlayerController {
             this.video_keep_alive_interval_timer_cancel();
             this.video_keep_alive_interval_timer_cancel = null;
         }
+
+        // pagehide リスナーを解除し、プレイヤー破棄前に現在の録画視聴セッションを即座に終了する
+        if (this.video_session_pagehide_handler !== null) {
+            window.removeEventListener('pagehide', this.video_session_pagehide_handler);
+            this.video_session_pagehide_handler = null;
+        }
+        // 画質切り替えなどで古いセッションを停止しても、新しいプレイヤーの初期化時にプレイリスト取得で新セッションが作られるため問題ない
+        this.sendVideoSessionTerminateBeacon();
 
         // HLS セッション復旧用のイベントハンドラーと状態を破棄
         this.removeVideoSessionRecoveryHandler();

@@ -343,3 +343,32 @@ async def VideoHLSKeepAliveAPI(
 
     # セッションのアクティブ状態を維持する
     video_stream.keepAlive()
+
+
+@router.post(
+    '/{video_id}/{quality}/terminate',
+    summary = '録画番組 HLS セッション終了 API',
+    status_code = status.HTTP_204_NO_CONTENT,
+)
+async def VideoHLSTerminateAPI(
+    video_id: Annotated[int, Path(description='録画番組の ID 。')],
+    quality: Annotated[str, Path(description='映像の品質。ex: 1080p')],
+    session_id: Annotated[str, Query(description='セッション ID（クライアント側で適宜生成したランダム値を指定する）。')],
+):
+    """
+    視聴終了時にクライアントから明示的に呼び出され、録画視聴セッションのエンコードタスクを即座に停止する。<br>
+    この API が呼び出されなかった場合も、SESSION_TIMEOUT 経過後に録画視聴セッションは自動的に破棄される。
+    fire-and-forget の遅延 beacon は正常系として扱うため、ここでは DB のバリデーションを行わずメモリ上のセッションだけを照会する。
+    """
+
+    # __new__() は未知の session_id に対してエラーを出すため、静かな照会用の classmethod を使う
+    # 遅延 beacon で番組情報が既に失われていても、DB 照会やエラーログを発生させず 204 を返す
+    video_stream = VideoStream.findBySessionId(session_id)
+    if video_stream is None:
+        return
+
+    # session_id の取り違えによる別録画番組の停止を防ぐため、パスの video_id と一致する場合だけ破棄する
+    if video_stream.recorded_program.id != video_id:
+        return
+
+    await video_stream.destroy()

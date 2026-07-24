@@ -110,6 +110,14 @@ class VideoStream:
     __segment_map_save_locks: ClassVar[weakref.WeakValueDictionary[int, asyncio.Lock]] = weakref.WeakValueDictionary()
 
 
+    @classmethod
+    def findBySessionId(cls, session_id: str) -> VideoStream | None:
+        """
+        セッション ID に対応する録画視聴セッションを取得する (存在しない場合は None)
+        """
+        return cls.__instances.get(session_id)
+
+
     # 必ずセッション ID ごとに1つのインスタンスになるように (Singleton)
     def __new__(
         cls,
@@ -185,6 +193,10 @@ class VideoStream:
             # 終了待機がタイムアウトした古い VideoEncodingTask のタスクへの参照
             # イベントループ上の Task は弱参照で管理されるため、自然終了するまでここで強参照を保持する
             instance._detached_video_encoding_task_refs = set()
+
+            # destroy() が二重に呼び出された場合の再入を防止するフラグ
+            instance._is_destroying = False
+            instance._is_destroyed = False
 
             # キャンセルされない限り SESSION_TIMEOUT 秒後にインスタンスを破棄するタイマー
             # cancel_destroy_timer() を呼び出すことでタイマーをキャンセルできる
@@ -266,6 +278,8 @@ class VideoStream:
         self._video_encoding_task_lock: asyncio.Lock
         self._video_encoding_task_ref: asyncio.Task[None] | None
         self._detached_video_encoding_task_refs: set[asyncio.Task[None]]
+        self._is_destroying: bool
+        self._is_destroyed: bool
         self._cancel_destroy_timer: Callable[[], None]
 
 
@@ -379,6 +393,10 @@ class VideoStream:
         録画視聴セッションのアクティブ状態を維持する
         番組の視聴中は定期的にこのメソッドを呼び出す必要があり、呼び出されなくなった場合は自動的に終了処理が行われる
         """
+
+        # terminate 後など、破棄中または破棄済みのインスタンスに遅延した Keep-Alive が届いてもタイマーを再作成しない
+        if self._is_destroying is True or self._is_destroyed is True:
+            return
 
         # 前回のタイマーをキャンセルする
         self._cancel_destroy_timer()
@@ -905,17 +923,27 @@ class VideoStream:
         ユーザーが番組の視聴を終了した (keepAlive() が呼び出されなくなった) 場合に自動的に呼び出される
         """
 
-        # 起動中のエンコードタスクがあればキャンセルする
-        # この時点ですでにエンコードを完了して終了している場合もある
-        async with self._video_encoding_task_lock:
-            await self.__cancelVideoEncodingTask()
+        # クライアントの beacon と SESSION_TIMEOUT のタイマーが競合しても、破棄処理を二重実行しない
+        if self._is_destroying is True or self._is_destroyed is True:
+            return
+        self._is_destroying = True
 
-        # すべての HLS セグメントを削除する
-        self._segments = []
+        try:
+            # 正常終了時はタイムアウト後の destroy() が再度呼ばれないようタイマーをキャンセルする
+            self._cancel_destroy_timer()
 
-        # アクティブな間保持されていたインスタンスを削除する
-        ## これにより、このインスタンスには誰も参照できなくなるため、ガベージコレクションによりメモリから解放される (はず)
-        ## 今後同じセッション ID が指定された場合は新たに別のインスタンスが生成される
-        self.__instances.pop(self.session_id)
+            # 起動中のエンコードタスクがあればキャンセルする
+            # この時点ですでにエンコードを完了して終了している場合もある
+            async with self._video_encoding_task_lock:
+                await self.__cancelVideoEncodingTask()
+
+            # すべての HLS セグメントを削除する
+            self._segments = []
+        finally:
+            # エンコードタスクの終了待機で例外が発生しても、セッション ID と破棄状態を必ず確定する
+            # これにより terminate とタイムアウトが競合した場合もセッションが辞書に残り続けることを防ぐ
+            self.__instances.pop(self.session_id, None)
+            self._is_destroying = False
+            self._is_destroyed = True
 
         logging.info(f'{self.log_prefix} Streaming Session Finished.')
