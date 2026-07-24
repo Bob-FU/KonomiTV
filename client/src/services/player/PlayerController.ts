@@ -70,6 +70,8 @@ class PlayerController {
     // ビデオ視聴: pagehide イベントで録画視聴セッションを終了するためのイベントハンドラー
     // destroy() で確実に解除するため保持しておく
     private video_session_pagehide_handler: ((event: PageTransitionEvent) => void) | null = null;
+    private video_session_terminate_url: string | null = null;
+    private video_session_video_id: number | null = null;
 
     // ビデオ視聴: HLS セッション復旧で使用する HLS プラグインとイベントハンドラー
     // 画質切り替えで HLS プラグインが入れ替わるため、破棄時に確実に解除できるよう保持しておく
@@ -1258,26 +1260,40 @@ class PlayerController {
 
 
     /**
-     * ビデオ視聴: 録画視聴セッションの終了をサーバーへ通知する
+     * ビデオ視聴: 録画視聴セッション終了用 URL を現在のプレイヤー情報から更新する
      */
-    private sendVideoSessionTerminateBeacon(): void {
+    private updateVideoSessionTerminateURL(): void {
         if (this.playback_mode !== 'Video' || this.player === null) {
             return;
         }
-        if (typeof navigator.sendBeacon !== 'function') {
-            return;
-        }
 
-        const player_store = usePlayerStore();
         const api_quality = PlayerUtils.extractVideoAPIQualityFromDPlayer(this.player);
         const session_id = PlayerUtils.extractSessionIdFromDPlayer(this.player);
-        if (!player_store.recorded_program || api_quality === null || api_quality === undefined ||
+        // 画質や session_id などを取得できない場合は、既に保持している URL を維持する
+        if (this.video_session_video_id === null || api_quality === null || api_quality === undefined ||
             session_id === null || session_id === undefined) {
             return;
         }
 
-        const url = `${Utils.api_base_url}/streams/video/${player_store.recorded_program.id}/${api_quality}/terminate?session_id=${session_id}`;
-        navigator.sendBeacon(url);
+        this.video_session_terminate_url = `${Utils.api_base_url}/streams/video/${this.video_session_video_id}/${api_quality}/terminate?session_id=${session_id}`;
+    }
+
+
+    /**
+     * ビデオ視聴: 録画視聴セッションの終了をサーバーへ通知する
+     */
+    private sendVideoSessionTerminateBeacon(): void {
+        if (this.playback_mode !== 'Video' || this.video_session_terminate_url === null) {
+            return;
+        }
+        const terminate_url = this.video_session_terminate_url;
+        // 送信可否に関わらず URL を破棄し、pagehide と destroy() の二重送信を防ぐ
+        this.video_session_terminate_url = null;
+        if (typeof navigator.sendBeacon !== 'function') {
+            return;
+        }
+
+        navigator.sendBeacon(terminate_url);
     }
 
 
@@ -1364,11 +1380,14 @@ class PlayerController {
         // Keep-Alive が行われなくなったタイミングで、サーバー側で自動的にビデオストリームの終了処理 (エンコードタスクの停止) が行われる
         if (this.playback_mode === 'Video') {
             this.video_keep_alive_interval_timer_cancel = Utils.setIntervalInWorker(async () => {
+                if (this.destroying === true || this.destroyed === true) return;
                 // 画質切り替えでベース URL が変わることも想定し、あえて毎回 API URL を取得している
-                if (this.player === null) return;
+                if (this.player === null || this.video_session_video_id === null) return;
+                // terminate 用 URL も毎回更新し、画質切り替え後のセッションを終了できるようにする
+                this.updateVideoSessionTerminateURL();
                 const api_quality = PlayerUtils.extractVideoAPIQualityFromDPlayer(this.player);
                 const session_id = PlayerUtils.extractSessionIdFromDPlayer(this.player);
-                const response = await APIClient.put(`${Utils.api_base_url}/streams/video/${player_store.recorded_program.id}/${api_quality}/keep-alive?session_id=${session_id}`);
+                const response = await APIClient.put(`${Utils.api_base_url}/streams/video/${this.video_session_video_id}/${api_quality}/keep-alive?session_id=${session_id}`);
 
                 // HTTP 422 はサーバーが録画視聴セッションの消滅を明言しているため、hls.js のリトライ枯渇を待たずに復旧する
                 // ステータスコードを取得できない一時的な通信失敗では、セッションが生きている可能性があるので復旧しない
@@ -1386,6 +1405,10 @@ class PlayerController {
                     }
                 }
             }, 5 * 1000);
+
+            // player と PlayerStore が正しい状態のうちに terminate 用 URL を保存しておく
+            this.video_session_video_id = player_store.recorded_program.id;
+            this.updateVideoSessionTerminateURL();
 
             // pagehide は通常の離脱だけでなく bfcache 行き (event.persisted === true) でも発火するため、どちらでも終了を通知する
             // bfcache から復帰した場合にセッションが既に破棄されていても、keep-alive 422 検知による自動復旧で再構築できる
@@ -1694,6 +1717,7 @@ class PlayerController {
                     // Native HLS では hls.js のイベントを利用できないため、以前のリスナーと状態を解除する
                     this.removeVideoSessionRecoveryHandler();
                     this.resetVideoSessionRecoveryState();
+                    // Native HLS でも同じセッション ID のプレイリストを使うため、terminate 用 URL は保持する
 
                     // 実はなぜか hls.js を使わずとも Safari では普通に Native HLS 再生できてしまうようなので、警告を出しつつ何もしない
                     // DPlayer 側の機能により、Native HLS 再生であっても字幕は表示される
@@ -2351,6 +2375,15 @@ class PlayerController {
         }
         this.destroying = true;
 
+        // SPA 遷移では非同期の破棄処理中に遷移先ページが player store をリセットするため、破棄時の状態に依存せず、また 0.2 秒のフェードアウトを待たずに即座にセッションを終了する
+        this.sendVideoSessionTerminateBeacon();
+
+        // 破棄開始後は Keep-Alive API を送る必要がないため、タイマーを即座に解除する
+        if (this.video_keep_alive_interval_timer_cancel !== null) {
+            this.video_keep_alive_interval_timer_cancel();
+            this.video_keep_alive_interval_timer_cancel = null;
+        }
+
         // 視聴履歴の最終位置を更新
         // 現在の再生位置を取得するため、プレイヤーの破棄前に実行する必要がある
         if (this.playback_mode === 'Video' && this.player && this.player.video) {
@@ -2417,18 +2450,13 @@ class PlayerController {
             this.live_force_seek_interval_timer_cancel();
             this.live_force_seek_interval_timer_cancel = null;
         }
-        if (this.video_keep_alive_interval_timer_cancel !== null) {
-            this.video_keep_alive_interval_timer_cancel();
-            this.video_keep_alive_interval_timer_cancel = null;
-        }
 
         // pagehide リスナーを解除し、プレイヤー破棄前に現在の録画視聴セッションを即座に終了する
         if (this.video_session_pagehide_handler !== null) {
             window.removeEventListener('pagehide', this.video_session_pagehide_handler);
             this.video_session_pagehide_handler = null;
         }
-        // 画質切り替えなどで古いセッションを停止しても、新しいプレイヤーの初期化時にプレイリスト取得で新セッションが作られるため問題ない
-        this.sendVideoSessionTerminateBeacon();
+        this.video_session_video_id = null;
 
         // HLS セッション復旧用のイベントハンドラーと状態を破棄
         this.removeVideoSessionRecoveryHandler();
